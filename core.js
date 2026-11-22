@@ -30,6 +30,13 @@
     fe: { label: 'Iron', unit: 'mg', target: 14, min: true },
     vitd: { label: 'Vitamin D', unit: 'mcg', target: 15, min: true },
   };
+  /** Adult DRI targets by sex (iron RDA 8 vs 18 mg, potassium AI 3400 vs 2600 mg) */
+  function microTargets(sex) {
+    const t = JSON.parse(JSON.stringify(MICRO_TARGETS));
+    if (sex === 'female') { t.fe.target = 18; t.k.target = 2600; t.fiber.target = 25; }
+    else { t.fe.target = 8; t.k.target = 3400; t.fiber.target = 38; }
+    return t;
+  }
 
   // Curated USDA-based whole & fitness food database (values per 100g)
   // name|cat|srvLabel|srvG|kcal|p|c|f|fiber|na|k|ca|fe|vitd
@@ -148,13 +155,99 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     return out;
   }
 
+  const NKEYS = ['kcal', 'p', 'c', 'f', 'fiber', 'na', 'k', 'ca', 'fe', 'vitd'];
+
+  /** Frozen per-100g copy of a food, stored on each log entry so later edits/deletes never rewrite history */
+  function snapFood(food) {
+    if (!food) return null;
+    const s = { name: food.name };
+    for (const k of NKEYS) s[k] = +food[k] || 0;
+    return s;
+  }
+
+  /** Nutrients for one log entry: quick entry → absolute values; food entry → snapshot (preferred) or live food */
+  function entryNutrients(e, foodById) {
+    if (!e) return foodNutrients(null, 0);
+    if (e.quick) return { kcal: +e.kcal || 0, p: +e.p || 0, c: +e.c || 0, f: +e.f || 0, fiber: +e.fiber || 0, na: 0, k: 0, ca: 0, fe: 0, vitd: 0 };
+    return foodNutrients(e.snap || (foodById && foodById[e.foodId]), e.grams);
+  }
+  function entryName(e, foodById) {
+    if (e.quick) return e.name || 'Quick Add';
+    return (e.snap && e.snap.name) || ((foodById && foodById[e.foodId]) || {}).name || 'Unknown food';
+  }
+
   /** Compute totals for a day's log entries */
   function dayTotals(entries, foodById) {
-    return sumNutrients((entries || []).map(e => {
-      if (e.quick) return { kcal: +e.kcal || 0, p: +e.p || 0, c: +e.c || 0, f: +e.f || 0, fiber: +e.fiber || 0, na: 0, k: 0, ca: 0, fe: 0, vitd: 0 };
-      const food = foodById[e.foodId];
-      return foodNutrients(food, e.grams);
-    }));
+    return sumNutrients((entries || []).map(e => entryNutrients(e, foodById)));
+  }
+
+  // ---------- Coaching day eligibility ----------
+  /** Which days feed the expenditure model.
+   * meta: 'done' (user marked complete) | 'skip' (user excluded) | undefined (auto).
+   * Auto days count only when finished (before today) and ≥ max(400, 50% of plan kcal). */
+  function coachDayStatus(dk, kcal, opts) {
+    opts = opts || {};
+    const today = opts.today || dateKey();
+    const st = (opts.dayMeta || {})[dk];
+    if (dk >= today) return 'open';
+    if (st === 'skip') return 'skip';
+    if (st === 'done') return kcal > 0 ? 'done' : 'empty';
+    if (!(kcal > 0)) return 'empty';
+    const minK = opts.planKcal > 0 ? Math.max(400, opts.planKcal * 0.5) : 400;
+    return kcal >= minK ? 'auto' : 'partial';
+  }
+  const COUNTS = { done: true, auto: true };
+
+  // ---------- Recents / Frequents ----------
+  /** Returns { recent: [foodId], frequent: [foodId] } from finished + current logs */
+  function recentFoods(logsByDate, opts) {
+    opts = opts || {};
+    const limit = opts.limit || 8, days = opts.days || 60, today = opts.today || dateKey();
+    const cutoff = addDays(today, -days);
+    const recent = [], seen = new Set(), counts = {};
+    for (const dk of Object.keys(logsByDate || {}).sort().reverse()) {
+      if (dk > today) continue;
+      const list = (logsByDate[dk] || []).slice().reverse();
+      for (const e of list) {
+        if (e.quick || !e.foodId) continue;
+        if (!seen.has(e.foodId)) { seen.add(e.foodId); if (recent.length < limit) recent.push(e.foodId); }
+        if (dk >= cutoff) counts[e.foodId] = (counts[e.foodId] || 0) + 1;
+      }
+    }
+    const frequent = Object.entries(counts).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id]) => id);
+    return { recent, frequent };
+  }
+
+  // ---------- Barcodes ----------
+  const digits = (s) => String(s ?? '').replace(/\D/g, '');
+  /** Canonical comparison key: digits with leading zeros stripped (UPC-A 12, EAN-13, GTIN-14 all collapse) */
+  function barcodeKey(code) { const d = digits(code); return d.replace(/^0+/, '') || d; }
+  function sameBarcode(a, b) { return !!digits(a) && !!digits(b) && barcodeKey(a) === barcodeKey(b); }
+  /** Expand an 8-digit UPC-E to 12-digit UPC-A (null if not UPC-E shaped) */
+  function upcEtoA(code) {
+    const d = digits(code);
+    if (d.length !== 8 || (d[0] !== '0' && d[0] !== '1')) return null;
+    const [n, a, b, c, e, f, g, chk] = d.split('');
+    let body;
+    if (g <= '2') body = a + b + g + '0000' + c + e + f;
+    else if (g === '3') body = a + b + c + '00000' + e + f;
+    else if (g === '4') body = a + b + c + e + '00000' + f;
+    else body = a + b + c + e + f + '0000' + g;
+    return n + body + chk;
+  }
+  /** Codes to try against online databases, most likely first (EAN-13 form, EAN-8 as-is, UPC-E expansion) */
+  function barcodeCandidates(code) {
+    const d = digits(code);
+    if (!d) return [];
+    const out = [];
+    const push = (x) => { if (x && !out.includes(x)) out.push(x); };
+    if (d.length === 8) push(d);
+    const s = d.replace(/^0+/, '');
+    if (s.length <= 13 && d.length !== 8) push(s.padStart(13, '0'));
+    const ua = upcEtoA(d);
+    if (ua) push(ua.padStart(13, '0'));
+    push(d);
+    return out;
   }
 
   /** Compute totals for a saved recipe/meal */
@@ -172,6 +265,7 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
   const toLb = (val, unit) => unit === 'kg' ? val * LB_PER_KG : val;
   const fromLb = (lb, unit) => unit === 'kg' ? lb / LB_PER_KG : lb;
   const toIn = (val, unit) => unit === 'kg' ? val / CM_PER_IN : val;
+  const fromIn = (inch, unit) => unit === 'kg' ? inch * CM_PER_IN : inch;
 
   /** US Navy body fat % estimate (inputs in inches) */
   function navyBodyFat({ sex, heightIn, waistIn, neckIn, hipIn }) {
@@ -256,17 +350,17 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
   // ---------- Adaptive Expenditure Algorithm ----------
   /** Computes adaptive TDEE from smoothed trend weight + rolling logged calories.
    * Returns { tdee, initial, observed, confidence (0..1), windowDays, avgIntake, weeklyTrendDeltaLb, series: [{date, tdee}] } */
-  function estimateExpenditure(profile, weights, logsByDate, foodById) {
+  function estimateExpenditure(profile, weights, logsByDate, foodById, opts) {
     const tr = trendWeights(weights);
     const latestW = tr.length ? tr[tr.length - 1].trend : (profile.startWeightLb || 175);
     const latestBf = (weights || []).slice().sort((a, b) => b.date.localeCompare(a.date)).find(w => w.bf > 0)?.bf || profile.bfPct;
     const init = initialTDEE(profile, latestW, latestBf);
 
-    // Map daily calories for days with meaningful logging (>= 400 kcal)
+    // Only finished, complete-looking (or user-confirmed) days feed the model — see coachDayStatus
     const intakeByDate = {};
     for (const dk in (logsByDate || {})) {
       const tot = dayTotals(logsByDate[dk], foodById);
-      if (tot.kcal >= 400) intakeByDate[dk] = tot.kcal;
+      if (COUNTS[coachDayStatus(dk, tot.kcal, opts)]) intakeByDate[dk] = tot.kcal;
     }
 
     if (tr.length < 7) {
@@ -374,8 +468,8 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
   }
 
   /** Weekly check-in proposal comparing current plan vs updated adaptive expenditure & timeline */
-  function weeklyCheckIn(profile, goal, weights, logsByDate, foodById, currentPlan) {
-    const exp = estimateExpenditure(profile, weights, logsByDate, foodById);
+  function weeklyCheckIn(profile, goal, weights, logsByDate, foodById, currentPlan, opts) {
+    const exp = estimateExpenditure(profile, weights, logsByDate, foodById, opts);
     const tr = trendWeights(weights);
     const latestW = tr.length ? tr[tr.length - 1].trend : (profile.startWeightLb || 175);
     const latestBf = (weights || []).slice().sort((a, b) => b.date.localeCompare(a.date)).find(w => w.bf > 0)?.bf || profile.bfPct;
@@ -420,9 +514,8 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     const rows = [cols.join(',')];
     for (const dk of Object.keys(logsByDate || {}).sort()) {
       for (const e of (logsByDate[dk] || [])) {
-        const food = e.quick ? null : foodById[e.foodId];
-        const n = e.quick ? { kcal: e.kcal, p: e.p, c: e.c, f: e.f, fiber: e.fiber || 0, na: 0, k: 0, ca: 0, fe: 0, vitd: 0 } : foodNutrients(food, e.grams);
-        const name = e.quick ? (e.name || 'Quick Add') : (food ? food.name : '?');
+        const n = entryNutrients(e, foodById);
+        const name = entryName(e, foodById);
         rows.push([dk, e.meal || 'Snacks', name, e.quick ? '' : round1(e.grams), round0(n.kcal), round1(n.p), round1(n.c), round1(n.f), round1(n.fiber), round0(n.na), round0(n.k), round0(n.ca), round1(n.fe), round1(n.vitd)].map(csvCell).join(','));
       }
     }
@@ -432,13 +525,16 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
   function biometricsToCSV(weights, unit) {
     const tr = trendWeights(weights);
     const trMap = Object.fromEntries(tr.map(x => [x.date, x.trend]));
-    const cols = ['Date', `Scale Weight (${unit})`, `Trend Weight (${unit})`, 'Body Fat (%)', `Lean Mass (${unit})`, `Waist (${unit === 'kg' ? 'cm' : 'in'})`, `Chest`, `Arms`, `Hips`, 'Note'];
+    const lu = unit === 'kg' ? 'cm' : 'in';
+    const cols = ['Date', `Scale Weight (${unit})`, `Trend Weight (${unit})`, 'Body Fat (%)', `Lean Mass (${unit})`, `Waist (${lu})`, `Neck (${lu})`, `Chest (${lu})`, `Arms (${lu})`, `Hips (${lu})`, 'Note'];
     const rows = [cols.join(',')];
+    // Tape measurements are stored in inches; convert for display
+    const len = (v) => v > 0 ? round1(fromIn(+v, unit)) : '';
     for (const w of (weights || []).slice().sort((a, b) => a.date.localeCompare(b.date))) {
       const dispW = round1(fromLb(w.weightLb, unit));
       const dispT = trMap[w.date] ? round1(fromLb(trMap[w.date], unit)) : '';
       const comp = bodyComp(dispW, w.bf);
-      rows.push([w.date, dispW, dispT, w.bf || '', comp.lbm || '', w.waist || '', w.chest || '', w.arms || '', w.hips || '', w.note || ''].map(csvCell).join(','));
+      rows.push([w.date, dispW, dispT, w.bf || '', comp.lbm || '', len(w.waist), len(w.neck), len(w.chest), len(w.arms), len(w.hips), w.note || ''].map(csvCell).join(','));
     }
     return rows.join('\n') + '\n';
   }
@@ -453,10 +549,13 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     const brand = (p.brands || "").split(",")[0].trim();
     if (!rawName && !brand) return null;
     const name = brand && !rawName.toLowerCase().includes(brand.toLowerCase()) ? `${rawName || "Product"} (${brand})` : (rawName || brand);
-    const kcal = +(n["energy-kcal_100g"] ?? n["energy-kcal"] ?? (n["energy-kj_100g"] ? n["energy-kj_100g"] / 4.184 : 0)) || 0;
+    // Per-100g only: bare "energy-kcal" can be per-serving; energy_100g is kJ
+    const kj = n["energy-kj_100g"] ?? n["energy_100g"];
+    const kcal = (n["energy-kcal_100g"] != null ? +n["energy-kcal_100g"] : (kj != null ? +kj / 4.184 : 0)) || 0;
     const prot = +(n.proteins_100g ?? 0) || 0;
     const carb = +(n.carbohydrates_100g ?? 0) || 0;
     const fat = +(n.fat_100g ?? 0) || 0;
+    if (!(kcal > 0) && !(prot + carb + fat > 0)) return null; // no usable nutrition panel
     const fiber = +(n.fiber_100g ?? 0) || 0;
     const naMg = n.sodium_100g != null ? (+n.sodium_100g * 1000) : (n.salt_100g != null ? +n.salt_100g * 400 : 0);
     const kMg = n.potassium_100g != null ? (+n.potassium_100g * 1000) : 0;
@@ -469,7 +568,7 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     }
     const srvG = (+p.serving_quantity > 0 && +p.serving_quantity <= 1000) ? round0(+p.serving_quantity) : 100;
     const srvLabel = (p.serving_size && String(p.serving_size).trim()) ? String(p.serving_size).trim().slice(0, 24) : `${srvG} g`;
-    const code = p.code ? String(p.code).trim() : "";
+    const code = digits(p.code); // crowd-sourced field; digits only (it ends up in ids/handlers)
     return {
       id: code ? ("off_" + code) : ("off_" + uid()),
       name: name.slice(0, 80),
@@ -508,9 +607,11 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     const name = brand && !desc.toLowerCase().includes(brand.toLowerCase()) ? `${desc} (${brand})` : desc;
     const srvG = (+item.servingSize > 0 && +item.servingSize <= 1000 && (!item.servingSizeUnit || /^(g|ml)$/i.test(item.servingSizeUnit))) ? round0(+item.servingSize) : 100;
     const srvLabel = item.householdServingFullText ? String(item.householdServingFullText).trim().slice(0, 24) : `${srvG} g`;
-    const code = item.gtinUpc ? String(item.gtinUpc).trim() : "";
+    if (!(kcal > 0) && !(prot + carb + fat > 0)) return null;
+    const code = digits(item.gtinUpc);
+    const fdc = digits(item.fdcId);
     return {
-      id: "usda_" + item.fdcId,
+      id: fdc ? ("usda_" + fdc) : ("usda_" + uid()),
       name: name.slice(0, 80),
       cat: "Other",
       srvLabel,
@@ -536,8 +637,8 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
           return {
             kind: "food",
             food: {
-              id: "qr_" + uid(), name: String(j.name).slice(0, 80), cat: j.cat || "Other",
-              srvLabel: j.srvLabel || "1 serving", srvG: +j.srvG || 100,
+              id: "qr_" + uid(), name: String(j.name).slice(0, 80), cat: CATS.includes(j.cat) ? j.cat : "Other",
+              srvLabel: String(j.srvLabel || "1 serving").slice(0, 24), srvG: +j.srvG > 0 ? +j.srvG : 100,
               kcal: +j.kcal || 0, p: +j.p || 0, c: +j.c || 0, f: +j.f || 0,
               fiber: +j.fiber || 0, na: +j.na || 0, k: +j.k || 0, ca: +j.ca || 0, fe: +j.fe || 0, vitd: +j.vitd || 0,
               source: "QR",
@@ -553,10 +654,12 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
   }
 
   const api = {
-    MEALS, CATS, ACTIVITY, SPLITS, PROT_TIERS, MICRO_TARGETS,
+    MEALS, CATS, ACTIVITY, SPLITS, PROT_TIERS, MICRO_TARGETS, microTargets, NKEYS,
     uid, clamp, round0, round1, dateKey, parseDateKey, addDays, daysBetween,
-    LB_PER_KG, CM_PER_IN, toLb, fromLb, toIn,
+    LB_PER_KG, CM_PER_IN, toLb, fromLb, toIn, fromIn,
     seedFoods, foodNutrients, sumNutrients, dayTotals, recipeTotals,
+    snapFood, entryNutrients, entryName, coachDayStatus, recentFoods,
+    barcodeKey, sameBarcode, upcEtoA, barcodeCandidates,
     navyBodyFat, bodyComp, initialTDEE, trendWeights, estimateExpenditure,
     buildPlan, weeklyCheckIn, diaryToCSV, biometricsToCSV, parseOFFProduct, parseUSDAFood, parseScanPayload,
   };

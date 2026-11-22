@@ -10,6 +10,7 @@
 <meta name="theme-color" content="#111114">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" href="icon-192.png">
 <title>openMACROS</title>
 <style>
 :root{
@@ -265,6 +266,12 @@ a{color:var(--acc-hi);text-decoration:none}
 .scan-line{position:absolute;left:14%;right:14%;top:50%;height:2px;background:linear-gradient(90deg,transparent,var(--acc-hi),transparent);pointer-events:none}
 .src-tag{font-size:10px;font-weight:700;letter-spacing:.05em;padding:2px 6px;border-radius:6px;background:var(--acc-deep);color:var(--acc-hi);text-transform:uppercase}
 .src-tag.usda{background:var(--ok-bg);color:var(--ok)}
+.scan-wrap.h5 .scan-frame,.scan-wrap.h5 .scan-line{display:none}
+#scan_fallback video{display:block;width:100%!important}
+.sec-h{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);font-weight:600;padding:10px 2px 2px}
+.fav{color:var(--warn)}
+button.star{min-height:34px;width:34px;padding:0;border-radius:9px;font-size:16px;color:var(--dim)}
+button.star.on{color:var(--warn);border-color:rgba(217,180,100,.35);background:var(--warn-bg)}
 </style>
 </head>
 <body>
