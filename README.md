@@ -2,7 +2,7 @@
 
 A private, offline-first nutrition tracker and adaptive macro coach — built as a companion PWA to **openGAINS**. Installs to your home screen, keeps every meal and weigh-in local on your device, and optionally connects directly to live food databases when online.
 
-Combines **MacroFactor**-style adaptive expenditure coaching (EWMA weight trend + non-punitive weekly check-ins) with **Cronometer**-style whole-food accuracy (macros, key micronutrients, custom recipes, and body composition tracking).
+Paying for shit is overrated, me and my close personal friend Claude think so at least. Try this in place of your nutrition tracker and let me know what you think.
 
 ---
 
