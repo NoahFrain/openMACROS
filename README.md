@@ -1,6 +1,6 @@
 # openMACROS
 
-A private, offline-first nutrition tracker and adaptive macro coach — built as a companion PWA to **openGAINS**. Installs to your home screen, runs with no account, no server, and no network, and keeps every meal and weigh-in local on your device.
+A private, offline-first nutrition tracker and adaptive macro coach — built as a companion PWA to **openGAINS**. Installs to your home screen, keeps every meal and weigh-in local on your device, and optionally connects directly to live food databases when online.
 
 Combines **MacroFactor**-style adaptive expenditure coaching (EWMA weight trend + non-punitive weekly check-ins) with **Cronometer**-style whole-food accuracy (macros, key micronutrients, custom recipes, and body composition tracking).
 
@@ -8,13 +8,13 @@ Combines **MacroFactor**-style adaptive expenditure coaching (EWMA weight trend 
 
 ## Structure
 
-Five source files, no build step, no dependencies.
+Five source files, no build step, no bundler.
 
 ```
 index.html              shell, all styles, app mount point
-core.js                 pure nutrition & adaptive coaching logic (node-testable)
-app.js                  state, rendering, actions, localStorage
-sw.js                   service worker, network-first with offline fallback
+core.js                 pure nutrition, adaptive coaching & API/QR parsers (node-testable)
+app.js                  state, rendering, live DB search, camera scanner, localStorage
+sw.js                   service worker, network-first for app shell, pass-through for APIs
 manifest.webmanifest    PWA metadata
 icon-180/192/512.png    home screen icons
 ```
@@ -25,32 +25,27 @@ Four tabs: **Log**, **Plan**, **Body**, **Data**.
 
 ## Key Capabilities
 
-- **Goal & Plan Builder**: Choose **Fat Loss**, **Dynamic Maintenance**, or **Muscle Gain**; set current body stats (with optional body fat %), target weight, weekly pace or target date, protein tier, and carb/fat split (Balanced, Lower Fat, Lower Carb, Keto).
-- **Adaptive Expenditure & Weekly Check-In**: Smooths daily weigh-ins using linear interpolation + EWMA trend weight, then blends your initial estimate (Katch-McArdle or Mifflin-St Jeor) toward observed energy expenditure from rolling food logs and trend weight change. Weekly check-ins propose updated calorie/macro targets without punitive "make-up" penalties.
-- **Food & Meal Logging**: 60+ starter whole & fitness foods with serving/gram scaling, Quick Add, copy-from-yesterday, custom foods, multi-ingredient **Saved Meals / Recipes**, daily water tracking, and key micronutrients (Fiber, Sodium, Potassium, Calcium, Iron, Vitamin D).
-- **Body Composition & Trends**: Track scale weight, smoothed trend weight, body fat % (including a built-in **US Navy** waist/neck/hip estimator), lean body mass, and tape measurements, with charts for Weight vs. Trend, Adaptive Expenditure, and 14-day Calorie Adherence.
-- **Data Ownership**: Local `localStorage` (`openmacros.v1`), full Diary CSV and Biometrics CSV exports, and JSON backup/restore.
+- **Live Food Databases**:
+  - **Open Food Facts** — works out of the box with no API key for packaged food search and UPC/EAN barcode lookups.
+  - **USDA FoodData Central** — paste your free personal API key (`fdc.nal.usda.gov/api-key-signup`) in **Data → Food databases** (stored only in your device's `localStorage`) for lab-verified whole and branded foods with deep micronutrients.
+  - **Offline Caching** — any online food you log or scan is automatically saved into your local food library so repeat logs work offline.
+- **Barcode & QR Code Scanner**:
+  - Uses the native browser `BarcodeDetector` API on Chrome/Android and automatically lazy-loads `html5-qrcode` as a WebKit/iOS Safari fallback, plus a manual barcode/QR entry field.
+  - Handles UPC/EAN food barcodes, GS1/OFF product URLs, and custom JSON food QR codes.
+- **Goal & Plan Builder**: Fat Loss, Dynamic Maintenance, or Muscle Gain; body stats & optional body fat %, target weight, weekly pace or target date, protein tier, and carb/fat split.
+- **Adaptive Expenditure & Weekly Check-In**: Linear-interpolated EWMA weight trend + rolling intake adaptive TDEE estimation with non-punitive weekly target updates.
+- **Food, Recipes & Micros**: 60+ offline starter foods, custom foods, multi-ingredient Saved Meals/Recipes, Quick Add, water tracking, and Fiber/Sodium/Potassium/Calcium/Iron/Vitamin D bars.
+- **Body Composition & Exports**: Scale vs. Trend Weight chart, Adaptive Expenditure chart, 14-day intake bar chart, US Navy BF% estimator, Diary & Biometrics CSV exports, and JSON backup/restore.
 
 ---
 
-## Deploying
+## Changelog
 
-Static files — any HTTPS host works.
+### v2 — 2026-11-22
+- Direct **Open Food Facts** text search & barcode lookup (no API key required)
+- Direct **USDA FoodData Central** search & barcode fallback via local-only API key setting
+- Camera **Barcode & QR Code Scanner** (native `BarcodeDetector` + automatic iOS Safari `html5-qrcode` fallback + manual input)
+- Automatic local caching of online/scanned foods for offline reuse
 
-1. Upload the unzipped files loose to the repo root.
-2. Enable GitHub Pages (or any static HTTPS host).
-3. Open in Safari / Chrome → **Add to Home Screen**.
-4. Launch once while online so the service worker caches it.
-
-## Development
-
-```bash
-python3 -m http.server 8000
-```
-
-`core.js` runs directly under Node for testing:
-
-```js
-const C = require('./core.js');
-C.estimateExpenditure(profile, weights, logs, foodById);
-```
+### v1 — 2026-11-22
+- Initial offline-first PWA release matching the **openGAINS** gray & dark-muted-purple design system
