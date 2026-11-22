@@ -443,13 +443,122 @@ Protein Bar (Standard)|Snacks|1 bar (60g)|60|333|33.3|36.7|11.7|13.3|333|200|150
     return rows.join('\n') + '\n';
   }
 
+
+  // ---------- External Food DB & QR Parsers ----------
+  /** Normalize an Open Food Facts product object into openMACROS food format (per 100g) */
+  function parseOFFProduct(p) {
+    if (!p || !p.nutriments) return null;
+    const n = p.nutriments;
+    const rawName = (p.product_name || p.product_name_en || "").trim();
+    const brand = (p.brands || "").split(",")[0].trim();
+    if (!rawName && !brand) return null;
+    const name = brand && !rawName.toLowerCase().includes(brand.toLowerCase()) ? `${rawName || "Product"} (${brand})` : (rawName || brand);
+    const kcal = +(n["energy-kcal_100g"] ?? n["energy-kcal"] ?? (n["energy-kj_100g"] ? n["energy-kj_100g"] / 4.184 : 0)) || 0;
+    const prot = +(n.proteins_100g ?? 0) || 0;
+    const carb = +(n.carbohydrates_100g ?? 0) || 0;
+    const fat = +(n.fat_100g ?? 0) || 0;
+    const fiber = +(n.fiber_100g ?? 0) || 0;
+    const naMg = n.sodium_100g != null ? (+n.sodium_100g * 1000) : (n.salt_100g != null ? +n.salt_100g * 400 : 0);
+    const kMg = n.potassium_100g != null ? (+n.potassium_100g * 1000) : 0;
+    const caMg = n.calcium_100g != null ? (+n.calcium_100g * 1000) : 0;
+    const feMg = n.iron_100g != null ? (+n.iron_100g * 1000) : 0;
+    let vitdMcg = 0;
+    if (n["vitamin-d_100g"] != null) {
+      const vd = +n["vitamin-d_100g"];
+      vitdMcg = vd < 0.01 ? vd * 1e6 : vd; // OFF stores g in some entries, mcg in others
+    }
+    const srvG = (+p.serving_quantity > 0 && +p.serving_quantity <= 1000) ? round0(+p.serving_quantity) : 100;
+    const srvLabel = (p.serving_size && String(p.serving_size).trim()) ? String(p.serving_size).trim().slice(0, 24) : `${srvG} g`;
+    const code = p.code ? String(p.code).trim() : "";
+    return {
+      id: code ? ("off_" + code) : ("off_" + uid()),
+      name: name.slice(0, 80),
+      cat: "Other",
+      srvLabel,
+      srvG,
+      kcal: round0(kcal), p: round1(prot), c: round1(carb), f: round1(fat),
+      fiber: round1(fiber), na: round0(naMg), k: round0(kMg), ca: round0(caMg), fe: round1(feMg), vitd: round1(vitdMcg),
+      barcode: code,
+      source: "OFF",
+    };
+  }
+
+  /** Normalize a USDA FoodData Central search item into openMACROS food format (per 100g) */
+  function parseUSDAFood(item) {
+    if (!item || !item.description) return null;
+    const nuts = item.foodNutrients || [];
+    const getN = (ids, nums) => {
+      const hit = nuts.find(x => ids.includes(x.nutrientId) || nums.includes(String(x.nutrientNumber || "")));
+      return hit ? (+hit.value || 0) : 0;
+    };
+    const kcal = getN([1008, 2047, 2048], ["208"]);
+    const prot = getN([1003], ["203"]);
+    const carb = getN([1005], ["205"]);
+    const fat = getN([1004], ["204"]);
+    const fiber = getN([1079], ["291"]);
+    const na = getN([1093], ["307"]);
+    const k = getN([1092], ["306"]);
+    const ca = getN([1087], ["301"]);
+    const fe = getN([1089], ["303"]);
+    const vdHit = nuts.find(x => x.nutrientId === 1114 || String(x.nutrientNumber || "") === "328");
+    const vitd = vdHit ? ((vdHit.unitName === "IU") ? (+vdHit.value / 40) : (+vdHit.value || 0)) : 0;
+
+    const brand = (item.brandName || item.brandOwner || "").trim();
+    const desc = String(item.description).trim();
+    const name = brand && !desc.toLowerCase().includes(brand.toLowerCase()) ? `${desc} (${brand})` : desc;
+    const srvG = (+item.servingSize > 0 && +item.servingSize <= 1000 && (!item.servingSizeUnit || /^(g|ml)$/i.test(item.servingSizeUnit))) ? round0(+item.servingSize) : 100;
+    const srvLabel = item.householdServingFullText ? String(item.householdServingFullText).trim().slice(0, 24) : `${srvG} g`;
+    const code = item.gtinUpc ? String(item.gtinUpc).trim() : "";
+    return {
+      id: "usda_" + item.fdcId,
+      name: name.slice(0, 80),
+      cat: "Other",
+      srvLabel,
+      srvG,
+      kcal: round0(kcal), p: round1(prot), c: round1(carb), f: round1(fat),
+      fiber: round1(fiber), na: round0(na), k: round0(k), ca: round0(ca), fe: round1(fe), vitd: round1(vitd),
+      barcode: code,
+      source: "USDA",
+    };
+  }
+
+  /** Interpret a scanned barcode or QR payload */
+  function parseScanPayload(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return { kind: "empty" };
+    // Pure numeric UPC/EAN barcode (6 to 14 digits)
+    if (/^\d{6,14}$/.test(s)) return { kind: "barcode", code: s };
+    // JSON food payload in a QR code
+    if (s.startsWith("{") && s.endsWith("}")) {
+      try {
+        const j = JSON.parse(s);
+        if (j && (j.kcal != null || j.p != null) && j.name) {
+          return {
+            kind: "food",
+            food: {
+              id: "qr_" + uid(), name: String(j.name).slice(0, 80), cat: j.cat || "Other",
+              srvLabel: j.srvLabel || "1 serving", srvG: +j.srvG || 100,
+              kcal: +j.kcal || 0, p: +j.p || 0, c: +j.c || 0, f: +j.f || 0,
+              fiber: +j.fiber || 0, na: +j.na || 0, k: +j.k || 0, ca: +j.ca || 0, fe: +j.fe || 0, vitd: +j.vitd || 0,
+              source: "QR",
+            },
+          };
+        }
+      } catch (e) { }
+    }
+    // URL containing an Open Food Facts or GS1 Digital Link GTIN/barcode (8-14 digits)
+    const m = s.match(/(?:product\/|\/01\/|barcode=|gtin=)(\d{8,14})/i);
+    if (m) return { kind: "barcode", code: m[1] };
+    return { kind: "text", text: s };
+  }
+
   const api = {
     MEALS, CATS, ACTIVITY, SPLITS, PROT_TIERS, MICRO_TARGETS,
     uid, clamp, round0, round1, dateKey, parseDateKey, addDays, daysBetween,
     LB_PER_KG, CM_PER_IN, toLb, fromLb, toIn,
     seedFoods, foodNutrients, sumNutrients, dayTotals, recipeTotals,
     navyBodyFat, bodyComp, initialTDEE, trendWeights, estimateExpenditure,
-    buildPlan, weeklyCheckIn, diaryToCSV, biometricsToCSV,
+    buildPlan, weeklyCheckIn, diaryToCSV, biometricsToCSV, parseOFFProduct, parseUSDAFood, parseScanPayload,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.Core = api;
 })(typeof window !== 'undefined' ? window : globalThis);

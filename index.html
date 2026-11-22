@@ -257,6 +257,14 @@ svg text{fill:var(--dim);font-size:10px;font-variant-numeric:tabular-nums}
 }
 a{color:var(--acc-hi);text-decoration:none}
 .chev{color:var(--dim);font-size:18px;line-height:1}
+
+/* Scanner & Online DB */
+.scan-wrap{position:relative;width:100%;aspect-ratio:4/3;background:#0a0a0d;border:1px solid var(--line2);border-radius:14px;overflow:hidden;margin-bottom:10px;display:flex;align-items:center;justify-content:center}
+.scan-wrap video{width:100%;height:100%;object-fit:cover;display:block}
+.scan-frame{position:absolute;inset:18% 12%;border:2px solid rgba(183,165,224,.75);border-radius:12px;box-shadow:0 0 0 9999px rgba(10,10,14,.42);pointer-events:none}
+.scan-line{position:absolute;left:14%;right:14%;top:50%;height:2px;background:linear-gradient(90deg,transparent,var(--acc-hi),transparent);pointer-events:none}
+.src-tag{font-size:10px;font-weight:700;letter-spacing:.05em;padding:2px 6px;border-radius:6px;background:var(--acc-deep);color:var(--acc-hi);text-transform:uppercase}
+.src-tag.usda{background:var(--ok-bg);color:var(--ok)}
 </style>
 </head>
 <body>
