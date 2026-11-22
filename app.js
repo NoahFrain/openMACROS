@@ -3,11 +3,14 @@
   'use strict';
   const C = window.Core;
   const KEY = 'openmacros.v1';
-  const BUILD = 'v2 · 2026-11-22';
+  const BUILD = 'v2.1 · 2026-11-22';
+  const SV = 2; // state schema version (storage KEY stays stable so existing data carries over)
+  const MKEYS = ['waist', 'neck', 'chest', 'arms', 'hips']; // tape measurements, stored in inches
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const r0 = (x) => Math.round(+x || 0);
   const r1 = (x) => Math.round((+x || 0) * 10) / 10;
+  const r2 = (x) => Math.round((+x || 0) * 100) / 100;
   const clone = (o) => JSON.parse(JSON.stringify(o));
 
   const ICONS = {
@@ -22,7 +25,7 @@
   // ---------- state ----------
   function fresh() {
     return {
-      v: 1,
+      v: SV,
       settings: { unit: 'lb', waterUnit: 'oz', showRemaining: true, waterGoalOz: 96, usdaKey: '' },
       profile: { sex: 'male', age: 30, heightIn: 70, startWeightLb: 180, bfPct: '', activity: 'moderate' },
       goal: null,
@@ -33,27 +36,51 @@
       logs: {},
       water: {},
       weights: [],
+      dayMeta: {},
       lastBackup: null,
     };
+  }
+  /** Normalize any stored/restored state to the current schema */
+  function migrate(j) {
+    const base = fresh();
+    const m = Object.assign(base, j);
+    m.settings = Object.assign(fresh().settings, j.settings || {});
+    m.profile = Object.assign(fresh().profile, j.profile || {});
+    m.dayMeta = j.dayMeta || {};
+    m.foods = Array.isArray(j.foods) ? j.foods : C.seedFoods();
+    // New seed foods from later builds appear without touching user edits
+    const have = new Set(m.foods.map(f => f.id));
+    for (const f of C.seedFoods()) if (!have.has(f.id)) m.foods.push(f);
+    if ((+j.v || 1) < 2) {
+      // v1 → v2: freeze nutrients onto entries; convert tape measurements to inches
+      const byId = Object.fromEntries(m.foods.map(f => [f.id, f]));
+      for (const dk in m.logs) for (const e of (m.logs[dk] || [])) {
+        if (!e.quick && !e.snap && byId[e.foodId]) e.snap = C.snapFood(byId[e.foodId]);
+      }
+      if (m.settings.unit === 'kg') for (const w of m.weights) for (const k of MKEYS) if (+w[k] > 0) w[k] = r2(w[k] / C.CM_PER_IN);
+    }
+    m.v = SV;
+    return m;
   }
   function load() {
     try {
       const j = JSON.parse(localStorage.getItem(KEY));
-      if (j && j.v) {
-        const base = fresh();
-        const merged = Object.assign(base, j);
-        merged.settings = Object.assign(base.settings, j.settings || {});
-        return merged;
-      }
+      if (j && j.v) return migrate(j);
     } catch (e) { }
     return fresh();
   }
   let S = load();
   function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('Could not save — storage full'); } }
 
+  // FOOD indexes every food, including soft-deleted (hidden) ones, so old entries & recipes still resolve
   let FOOD = {};
   function reindex() { FOOD = Object.fromEntries(S.foods.map(f => [f.id, f])); }
   reindex();
+  const visibleFoods = () => S.foods.filter(f => !f.hidden);
+  const coachOpts = () => ({ dayMeta: S.dayMeta, planKcal: S.plan ? S.plan.kcal : 0 });
+  const dispL = (inch) => +inch > 0 ? r1(C.fromIn(+inch, S.settings.unit)) : '';
+  const OZ_PER_ML = 1 / 29.5735;
+  const waterStep = () => S.settings.waterUnit === 'ml' ? 250 * OZ_PER_ML : 8;
 
   const ui = {
     tab: 'log',
@@ -95,12 +122,16 @@
   // ---------- Online Food DBs (Open Food Facts + USDA FoodData Central) ----------
   function cacheOnlineFood(food) {
     if (!food) return null;
-    const existing = S.foods.find(f => f.id === food.id || (food.barcode && f.barcode === food.barcode));
-    if (existing) return existing;
+    const existing = S.foods.find(f => f.id === food.id || (food.barcode && C.sameBarcode(f.barcode, food.barcode)));
+    if (existing) {
+      if (existing.hidden) { existing.hidden = false; save(); }
+      return existing;
+    }
     S.foods.unshift(food);
     save(); reindex();
     return food;
   }
+  const findLocalBarcode = (cands) => S.foods.find(f => f.barcode && cands.some(c => C.sameBarcode(f.barcode, c)));
 
   async function searchOFF(query) {
     const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=20&fields=code,product_name,product_name_en,brands,serving_size,serving_quantity,nutriments`;
@@ -130,16 +161,20 @@
   }
 
   async function lookupBarcodeAny(code) {
-    const local = S.foods.find(f => f.barcode === code);
-    if (local) return { food: local, from: 'Local' };
-    try {
-      const off = await lookupBarcodeOFF(code);
-      if (off) return { food: cacheOnlineFood(off), from: 'Open Food Facts' };
-    } catch (e) { }
+    // Normalize: UPC-A (12), EAN-13, GTIN-14 and UPC-E all match the same cached product
+    const cands = C.barcodeCandidates(code);
+    const local = findLocalBarcode(cands);
+    if (local) { if (local.hidden) { local.hidden = false; save(); } return { food: local, from: 'Local' }; }
+    for (const c of cands.slice(0, 2)) {
+      try {
+        const off = await lookupBarcodeOFF(c);
+        if (off) { if (!off.barcode) off.barcode = c; return { food: cacheOnlineFood(off), from: 'Open Food Facts' }; }
+      } catch (e) { break; } // network failure — don't retry other forms
+    }
     if ((S.settings.usdaKey || '').trim()) {
       try {
-        const list = await searchUSDA(code);
-        const exact = list.find(x => x.barcode === code) || list[0];
+        const list = await searchUSDA(String(code).replace(/\D/g, ''));
+        const exact = list.find(x => x.barcode && cands.some(c => C.sameBarcode(x.barcode, c))); // exact GTIN match only
         if (exact) return { food: cacheOnlineFood(exact), from: 'USDA' };
       } catch (e) { }
     }
@@ -148,8 +183,11 @@
 
   // ---------- Camera Barcode / QR Scanner (Native BarcodeDetector + iOS Fallback) ----------
   let scanStream = null, scanTimer = null, html5Scanner = null, scanBusy = false;
+  // Every stop bumps the session; an async start that resumes under a stale session tears itself down
+  let scanSession = 0;
 
   function stopScanner() {
+    scanSession++;
     scanBusy = false;
     if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
     if (scanStream) { try { scanStream.getTracks().forEach(t => t.stop()); } catch (e) { } scanStream = null; }
@@ -172,8 +210,9 @@
 
   async function startScanner() {
     stopScanner();
-    const statusEl = $('#scan_status');
-    const setSt = (msg) => { if ($('#scan_status')) $('#scan_status').textContent = msg; };
+    const my = scanSession;
+    const alive = () => my === scanSession && ui.modal && ui.modal.type === 'scan';
+    const setSt = (msg) => { if (alive() && $('#scan_status')) $('#scan_status').textContent = msg; };
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setSt('Camera unavailable here (requires HTTPS). Enter barcode manually below.');
@@ -184,11 +223,14 @@
     if ('BarcodeDetector' in window) {
       try {
         const detector = new window.BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'qr_code'] });
-        scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        if (!alive()) { stream.getTracks().forEach(t => t.stop()); return; } // sheet closed during permission prompt
+        scanStream = stream;
         const vid = $('#scan_vid');
         if (!vid) { stopScanner(); return; }
         vid.srcObject = scanStream;
         await vid.play();
+        if (!alive()) return;
         setSt('Point camera at a food barcode or QR code');
         scanTimer = setInterval(async () => {
           if (scanBusy || !vid || vid.readyState < 2) return;
@@ -202,33 +244,48 @@
         }, 220);
         return;
       } catch (e) {
+        if (!alive()) return;
         stopScanner();
-        // Fall through to html5-qrcode or manual entry
+        return startScannerFallback(scanSession); // continue under the new session
       }
     }
+    return startScannerFallback(my);
+  }
 
-    // Path 2: iOS Safari / Firefox fallback via lazy-loaded html5-qrcode
-    setSt('Loading iOS/WebKit scanner…');
+  // Path 2: iOS Safari / Firefox — bundled html5-qrcode (vendor/, precached by the service worker, works offline)
+  async function startScannerFallback(my) {
+    const alive = () => my === scanSession && ui.modal && ui.modal.type === 'scan';
+    const setSt = (msg) => { if (alive() && $('#scan_status')) $('#scan_status').textContent = msg; };
+    setSt('Starting camera…');
+    let inst = null;
     try {
-      await loadScriptOnce('https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js');
+      await loadScriptOnce('vendor/html5-qrcode.min.js');
+      if (!alive()) return;
       const box = $('#scan_fallback');
       if (!box || !window.Html5Qrcode) return;
       if ($('#scan_vid')) $('#scan_vid').style.display = 'none';
-      html5Scanner = new window.Html5Qrcode('scan_fallback');
-      await html5Scanner.start(
+      const F = window.Html5QrcodeSupportedFormats;
+      const cfg = { verbose: false, experimentalFeatures: { useBarCodeDetectorIfSupported: true } };
+      if (F) cfg.formatsToSupport = [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.QR_CODE];
+      inst = new window.Html5Qrcode('scan_fallback', cfg);
+      html5Scanner = inst;
+      await inst.start(
         { facingMode: 'environment' },
-        { fps: 10, qrbox: { width: 240, height: 150 } },
+        { fps: 12, qrbox: (w, h) => ({ width: Math.round(w * 0.78), height: Math.round(Math.min(h * 0.5, w * 0.45)) }) },
         (decoded) => {
-          if (scanBusy || !decoded) return;
+          if (scanBusy || !decoded || !alive()) return;
           scanBusy = true;
           A.handleScan(decoded);
         },
         () => { }
       );
+      if (!alive()) { inst.stop().then(() => inst.clear()).catch(() => { }); return; } // closed while starting
+      const wrap = document.querySelector('.scan-wrap'); if (wrap) wrap.classList.add('h5'); // html5-qrcode draws its own frame
       setSt('Point camera at a food barcode or QR code');
     } catch (e) {
+      if (!alive()) { if (inst) inst.stop().catch(() => { }); return; }
       stopScanner();
-      setSt('Camera scanner unavailable (' + (e.message || 'permission denied') + '). Enter barcode manually below.');
+      if ($('#scan_status')) $('#scan_status').textContent = 'Camera scanner unavailable (' + (e && e.message ? e.message : e || 'permission denied') + '). Enter barcode manually below.';
     }
   }
 
@@ -310,6 +367,8 @@
     if (!standalone && /iPhone|iPad/.test(navigator.userAgent) && !ui.tipHidden) {
       h += `<div class="card notice sm row"><div class="sp"><b>Install openMACROS:</b> tap Share → <b>Add to Home Screen</b> for full-screen offline use.</div><button class="sm ghost" onclick="ui_hideTip()">✕</button></div>`;
     }
+    const oldBackup = !S.lastBackup || Date.now() - S.lastBackup > 14 * 864e5;
+    if (Object.keys(S.logs).length >= 5 && oldBackup) h += `<div class="card notice sm row"><span class="sp">No backup in 14+ days.</span><a href="#" onclick="A.go('data');return false">Export now →</a></div>`;
     if (checkDue) {
       h += `<div class="card notice row"><div class="sp"><b class="sm">Weekly check-in ready</b><div class="xs mut">Review adaptive expenditure &amp; update targets</div></div><button class="pri sm" onclick="A.openCheckIn()">Check in</button></div>`;
     }
@@ -347,23 +406,24 @@
     const isMl = S.settings.waterUnit === 'ml';
     const wDisp = isMl ? Math.round(wOz * 29.5735) : r0(wOz);
     const wGoal = isMl ? Math.round(S.settings.waterGoalOz * 29.5735) : S.settings.waterGoalOz;
-    const fibTarget = (plan && plan.fiber) || C.MICRO_TARGETS.fiber.target;
+    const MT = C.microTargets(S.profile.sex);
+    const fibTarget = (plan && plan.fiber) || MT.fiber.target;
     h += `<div class="card" style="padding:12px 15px">
       <div class="row" style="cursor:pointer" onclick="ui_toggleMicros()">
         <div class="sp"><b class="sm">Micronutrients &amp; Water</b><div class="xs mut num" style="margin-top:2px">Fiber ${r0(tot.fiber)}/${fibTarget}g · Water ${wDisp}/${wGoal} ${S.settings.waterUnit}</div></div>
-        <button class="sm" onclick="event.stopPropagation();A.addWater(8)">+${isMl ? '250ml' : '8oz'}</button>
+        <button class="sm" onclick="event.stopPropagation();A.addWater(1)">+${isMl ? '250ml' : '8oz'}</button>
         <span class="chev">${ui.microsOpen ? '▾' : '▸'}</span>
       </div>`;
     if (ui.microsOpen) {
       h += `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">`;
-      Object.entries(C.MICRO_TARGETS).forEach(([k, meta]) => {
+      Object.entries(MT).forEach(([k, meta]) => {
         const tgt = k === 'fiber' ? fibTarget : meta.target;
         const val = tot[k] || 0;
         const pct = C.clamp((val / tgt) * 100, 0, 100);
         const col = meta.cap ? (val > tgt ? 'var(--warn)' : 'var(--acc)') : (val >= tgt ? 'var(--ok)' : 'var(--acc)');
         h += `<div class="row" style="padding:5px 0"><span class="xs" style="width:76px;color:var(--tx2)">${meta.label}</span><div class="bar sp"><i style="width:${pct}%;background:${col}"></i></div><span class="xs num mut" style="width:94px;text-align:right">${k === 'fe' || k === 'vitd' ? r1(val) : r0(val)} / ${tgt}${meta.unit}</span></div>`;
       });
-      h += `<div class="row" style="margin-top:8px"><button class="sm ghost" onclick="A.addWater(-8)">−${isMl ? '250ml' : '8oz'} water</button><span class="sp"></span><button class="sm ghost" onclick="A.copyYesterday()">Copy yesterday's log</button></div></div>`;
+      h += `<div class="row" style="margin-top:8px"><button class="sm ghost" onclick="A.addWater(-1)">−${isMl ? '250ml' : '8oz'} water</button><span class="sp"></span><button class="sm ghost" onclick="A.copyYesterday()">Copy yesterday's log</button></div></div>`;
     }
     h += '</div>';
 
@@ -376,20 +436,44 @@
           <button class="sm" onclick="A.openAdd('${meal}')">+ Add</button>
         </div>`;
       mItems.forEach(e => {
-        const food = e.quick ? null : FOOD[e.foodId];
-        const n = e.quick ? e : C.foodNutrients(food, e.grams);
-        const title = e.quick ? (e.name || 'Quick Add') : (food ? food.name : '?');
+        const n = C.entryNutrients(e, FOOD);
+        const title = C.entryName(e, FOOD);
         const sub = e.quick ? 'Quick entry' : `${r0(e.grams)}g · P ${r0(n.p)} · C ${r0(n.c)} · F ${r0(n.f)}`;
         h += `<div class="li" onclick="A.editEntry('${e.id}')"><div class="sp"><div class="sm" style="color:var(--tx)">${esc(title)}</div><div class="xs mut num">${esc(sub)}</div></div><b class="sm num">${r0(n.kcal)}</b></div>`;
       });
       h += '</div>';
     });
 
+    h += coachDayCard(dk, tot.kcal, entries.length);
+
     if (!entries.length) {
       const yEntries = S.logs[C.addDays(dk, -1)] || [];
       if (yEntries.length) h += `<button class="ghost" style="width:100%" onclick="A.copyYesterday()">Copy yesterday's meals (${yEntries.length} items)</button>`;
     }
     return h;
+  }
+
+  // Whether this day feeds the adaptive expenditure model, with a manual override
+  function coachDayCard(dk, kcal, n) {
+    const meta = S.dayMeta[dk];
+    if (!n && !meta) return '';
+    const st = C.coachDayStatus(dk, kcal, coachOpts());
+    const minK = r0(Math.max(400, (S.plan ? S.plan.kcal : 0) * 0.5));
+    const txt = {
+      open: meta === 'done' ? 'Marked complete — counts once the day ends' : meta === 'skip' ? 'Excluded from coaching' : 'Day in progress — not used until it ends',
+      auto: 'Counts toward adaptive expenditure',
+      partial: `Looks partial (under ${minK} kcal) — excluded. Mark complete if this was a full day.`,
+      done: 'Marked complete — counts toward coaching',
+      skip: 'Excluded from coaching',
+      empty: 'Nothing logged — not used',
+    }[st];
+    const chip = { auto: 'ok-chip', done: 'ok-chip', partial: 'warn-chip', skip: 'warn-chip' }[st] || '';
+    const btns = [
+      meta !== 'done' ? `<button class="sm" onclick="A.dayMeta('done')">Mark complete</button>` : '',
+      meta !== 'skip' ? `<button class="sm ghost" onclick="A.dayMeta('skip')">Exclude</button>` : '',
+      meta ? `<button class="sm ghost" onclick="A.dayMeta('')">Auto</button>` : '',
+    ].join('');
+    return `<div class="card" style="padding:11px 14px"><div class="row" style="flex-wrap:wrap;gap:8px"><div class="sp" style="min-width:160px"><div class="row" style="gap:6px"><b class="sm">Coaching data</b><span class="chip ${chip}">${{ open: 'Open', auto: 'Counted', partial: 'Partial', done: 'Complete', skip: 'Excluded', empty: 'Empty' }[st]}</span></div><div class="xs mut" style="margin-top:3px">${txt}</div></div><div class="row" style="gap:4px">${btns}</div></div></div>`;
   }
 
   function macroBox(label, val, target, color, remMode) {
@@ -402,7 +486,7 @@
   function viewPlan() {
     if (ui.wiz) return viewWiz();
     const g = S.goal, p = S.plan;
-    const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD);
+    const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD, coachOpts());
     let h = brandBar() + '<h1>Plan &amp; Coach</h1>';
 
     if (!g || !p) {
@@ -437,6 +521,7 @@
   }
 
   // ---------- Guided Goal Wizard ----------
+  const rateLabel = (w) => `${w.ratePctWk}% BW/wk (${r1(C.fromLb(w.startWeightLb * w.ratePctWk / 100, S.settings.unit))} ${uW()}/wk)`;
   function viewWiz() {
     const w = ui.wiz;
     const head = (title, step, back) => brandBar() + `<div class="row" style="margin:2px 0 4px"><button class="sm ghost" style="padding-left:4px" onclick="A.wizBack('${back}')">‹ Back</button><span class="sp"></span><span class="mut xs">${step}</span></div><h1>${title}</h1>`;
@@ -468,10 +553,10 @@
         <div class="card">
           <div class="g2" style="margin-bottom:10px">
             <label class="xs mut">Target weight (${uW()})<input type="number" step="any" value="${dispTgtW}" oninput="A.wizWeight('targetWeightLb',this.value)"></label>
-            <label class="xs mut">Target date (optional)<input type="date" value="${w.targetDate || ''}" onchange="A.wizDate(this.value)"></label>
+            <label class="xs mut">Target date (optional)<input id="wiz_date" type="date" value="${w.targetDate || ''}" onchange="A.wizDate(this.value)"></label>
           </div>
-          ${w.mode !== 'maintain' ? `<label class="xs mut">Weekly pace: <b style="color:var(--acc-hi)">${w.ratePctWk}% BW/wk</b> (${r1(C.fromLb(w.startWeightLb * w.ratePctWk / 100, S.settings.unit))} ${uW()}/wk)
-            <input type="range" min="0.2" max="1.25" step="0.05" value="${w.ratePctWk}" style="padding:0;min-height:30px;accent-color:var(--acc)" oninput="A.wizRate(+this.value)">
+          ${w.mode !== 'maintain' ? `<label class="xs mut">Weekly pace: <b id="wiz_rate" style="color:var(--acc-hi)">${rateLabel(w)}</b>
+            <input type="range" min="0.2" max="1.25" step="0.05" value="${w.ratePctWk}" style="padding:0;min-height:30px;accent-color:var(--acc)" oninput="A.wizRate(+this.value)" onchange="A.reRender()">
           </label>` : '<div class="xs mut">Dynamic Maintenance keeps you within ±1.5% of your target weight.</div>'}
         </div>
         <button class="pri" style="width:100%" onclick="A.wizGo('macros')">Next: macro targets ›</button>`;
@@ -503,7 +588,7 @@
   // ---------- Body Comp & Analytics Tab ----------
   function viewBody() {
     const tr = C.trendWeights(S.weights);
-    const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD);
+    const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD, coachOpts());
     const sortedW = S.weights.slice().sort((a, b) => b.date.localeCompare(a.date));
     const latest = sortedW[0] || null;
     const latestTrend = tr.length ? tr[tr.length - 1].trend : null;
@@ -546,7 +631,7 @@
     if (!sortedW.length) h += `<div class="mut sm" style="padding:12px 0">No weigh-ins logged yet.</div>`;
     else {
       sortedW.slice(0, 12).forEach(w => {
-        const extras = [w.bf ? w.bf + '% BF' : '', w.waist ? 'Waist ' + w.waist + uL() : '', w.chest ? 'Chest ' + w.chest + uL() : '', w.arms ? 'Arms ' + w.arms + uL() : ''].filter(Boolean).join(' · ');
+        const extras = [w.bf ? w.bf + '% BF' : '', w.waist ? 'Waist ' + dispL(w.waist) + uL() : '', w.chest ? 'Chest ' + dispL(w.chest) + uL() : '', w.arms ? 'Arms ' + dispL(w.arms) + uL() : ''].filter(Boolean).join(' · ');
         h += `<div class="li" onclick="A.openWeigh('${w.id}')"><div class="sp"><b class="sm num">${dispW(w.weightLb)} ${uW()}</b><div class="xs mut">${dstr(w.date)}${extras ? ' · ' + esc(extras) : ''}</div></div><button class="sm ghost bad" onclick="event.stopPropagation();A.delWeigh('${w.id}')">✕</button></div>`;
       });
     }
@@ -577,16 +662,22 @@
       <label class="xs mut">Daily water goal (${S.settings.waterUnit})<input type="number" inputmode="numeric" value="${S.settings.waterUnit === 'ml' ? Math.round(S.settings.waterGoalOz * 29.5735) : S.settings.waterGoalOz}" onchange="A.setWaterGoal(this.value)"></label>
     </div>`;
 
-    const flist = S.foods.filter(f => (!ui.foodCat || f.cat === ui.foodCat) && (!ui.foodQ || f.name.toLowerCase().includes(ui.foodQ.toLowerCase())));
-    h += `<h2>Food library (${S.foods.length})</h2><div class="card">
+    h += `<h2>Food library (${visibleFoods().length})</h2><div class="card">
       <div class="row" style="margin-bottom:10px"><input placeholder="Filter foods…" value="${esc(ui.foodQ)}" oninput="ui_foodQ(this.value)"><button class="sm pri" onclick="A.openFoodEdit(null)">+ Food</button></div>
       <div class="chips" style="margin-bottom:10px">${['', ...C.CATS].map(c => `<button class="chip ${ui.foodCat === c ? 'sel' : ''}" onclick="ui_foodCat('${c}')">${c || 'All'}</button>`).join('')}</div>
-      <div style="max-height:320px;overflow:auto">${flist.slice(0, 60).map(f => `<div class="li" onclick="A.openFoodEdit('${f.id}')"><div class="sp"><div class="sm">${esc(f.name)}</div><div class="xs mut num">${f.kcal} kcal / 100g · P ${f.p} · C ${f.c} · F ${f.f}${f.barcode ? ' · ' + esc(f.barcode) : ''}</div></div>${f.source ? `<span class="src-tag ${f.source === 'USDA' ? 'usda' : ''}">${esc(f.source)}</span>` : `<span class="chip">${esc(f.cat)}</span>`}</div>`).join('') || '<div class="mut sm" style="padding:10px 0">No matching foods.</div>'}</div>
+      <div id="lib_list" style="max-height:320px;overflow:auto">${libListHTML()}</div>
     </div>`;
 
     h += `<div style="height:8px"></div><button class="bad ghost" style="width:100%" onclick="A.reset()">Erase all data</button>
       <div class="xs dim num" style="text-align:center;margin:16px 0 6px">openMACROS · build ${BUILD}</div>`;
     return h;
+  }
+
+  function libListHTML() {
+    const q = ui.foodQ.toLowerCase();
+    const flist = visibleFoods().filter(f => (!ui.foodCat || f.cat === ui.foodCat) && (!q || f.name.toLowerCase().includes(q)));
+    const rows = flist.slice(0, 80).map(f => `<div class="li" onclick="A.openFoodEdit('${f.id}')"><div class="sp"><div class="sm">${f.fav ? '<span class="fav">★</span> ' : ''}${esc(f.name)}</div><div class="xs mut num">${f.kcal} kcal / 100g · P ${f.p} · C ${f.c} · F ${f.f}${f.barcode ? ' · ' + esc(f.barcode) : ''}</div></div>${f.source ? `<span class="src-tag ${f.source === 'USDA' ? 'usda' : ''}">${esc(f.source)}</span>` : `<span class="chip">${esc(f.cat)}</span>`}</div>`).join('');
+    return (rows || '<div class="mut sm" style="padding:10px 0">No matching foods.</div>') + (flist.length > 80 ? `<div class="xs dim" style="padding:8px 2px">Showing 80 of ${flist.length} — refine the filter.</div>` : '');
   }
 
   // ---------- Modals ----------
@@ -618,11 +709,15 @@
       let body = `<div class="row" style="margin-bottom:10px"><b class="sp" style="font-size:17px">Add to ${esc(m.meal)}</b><button class="sm" onclick="A.openScan('${esc(m.meal)}')">${ICONS.scan} Scan</button><button class="sm ghost" onclick="A.closeModal()">Close</button></div>
         <div class="seg"><button class="${sub === 'foods' ? 'on' : ''}" onclick="A.addSub('foods')">Foods</button><button class="${sub === 'meals' ? 'on' : ''}" onclick="A.addSub('meals')">Saved Meals</button><button class="${sub === 'quick' ? 'on' : ''}" onclick="A.addSub('quick')">Quick Add</button></div>`;
       if (sub === 'foods') {
-        if (m.picked) {
+        if (m.picked && !FOOD[m.picked]) {
+          body += `<div class="card notice sm">This food no longer exists in your library and the entry has no saved nutrition.</div>
+            ${m.editId ? `<button class="bad" style="width:100%" onclick="A.delEntry('${m.editId}')">Delete entry</button>` : `<button style="width:100%" onclick="A.unpickFood()">Pick another food</button>`}`;
+        } else if (m.picked) {
           const f = FOOD[m.picked];
           const grams = m.unitMode === 'srv' ? (m.qty * f.srvG) : m.qty;
           const n = C.foodNutrients(f, grams);
-          body += `<div class="card hero"><div class="row"><b class="sp">${esc(f.name)}</b><button class="sm ghost" onclick="A.unpickFood()">Change</button></div>
+          body += `<div class="card hero"><div class="row"><b class="sp">${esc(f.name)}</b><button class="star ${f.fav ? 'on' : ''}" title="Favorite" onclick="A.toggleFav('${f.id}')">${f.fav ? '★' : '☆'}</button><button class="sm ghost" onclick="A.unpickFood()">Change</button></div>
+            ${m.editId ? `<div style="margin-top:10px"><label class="xs mut">Meal<select onchange="A.setMeal(this.value)">${C.MEALS.map(x => `<option ${x === m.meal ? 'selected' : ''}>${x}</option>`).join('')}</select></label></div>` : ''}
             <div class="g2" style="margin:10px 0"><label class="xs mut">Amount<input id="a_qty" type="number" step="any" inputmode="decimal" value="${m.qty}" oninput="A.setQty(this.value)"></label>
             <label class="xs mut">Unit<select onchange="A.setUnitMode(this.value)"><option value="srv" ${m.unitMode === 'srv' ? 'selected' : ''}>${esc(f.srvLabel)} (${f.srvG}g)</option><option value="g" ${m.unitMode === 'g' ? 'selected' : ''}>Grams (g)</option></select></label></div>
             <div id="a_prev" class="g4">
@@ -635,7 +730,7 @@
             ${m.editId ? `<button class="bad ghost" style="width:100%;margin-top:6px" onclick="A.delEntry('${m.editId}')">Delete entry</button>` : ''}</div>`;
         } else {
           body += `<div class="chips" style="margin-bottom:8px">
-              <button class="chip ${src === 'local' ? 'sel' : ''}" onclick="A.setAddSrc('local')">Local (${S.foods.length})</button>
+              <button class="chip ${src === 'local' ? 'sel' : ''}" onclick="A.setAddSrc('local')">Local (${visibleFoods().length})</button>
               <button class="chip ${src === 'off' ? 'sel' : ''}" onclick="A.setAddSrc('off')">Open Food Facts</button>
               <button class="chip ${src === 'usda' ? 'sel' : ''}" onclick="A.setAddSrc('usda')">USDA${S.settings.usdaKey ? '' : ' (key)'}</button>
             </div>
@@ -657,6 +752,7 @@
       } else {
         body += `<input id="q_name" placeholder="Label (e.g. Restaurant lunch)" value="${esc(m.qName || '')}" style="margin-bottom:8px">
           <div class="g2" style="margin-bottom:8px"><label class="xs mut">Calories<input id="q_kcal" type="number" inputmode="numeric" value="${m.qKcal || ''}"></label><label class="xs mut">Protein (g)<input id="q_p" type="number" inputmode="decimal" value="${m.qP || ''}"></label></div>
+          ${m.editId ? `<div style="margin-bottom:8px"><label class="xs mut">Meal<select onchange="A.setMeal(this.value)">${C.MEALS.map(x => `<option ${x === m.meal ? 'selected' : ''}>${x}</option>`).join('')}</select></label></div>` : ''}
           <div class="g3" style="margin-bottom:12px"><label class="xs mut">Carbs (g)<input id="q_c" type="number" inputmode="decimal" value="${m.qC || ''}"></label><label class="xs mut">Fat (g)<input id="q_f" type="number" inputmode="decimal" value="${m.qF || ''}"></label><label class="xs mut">Fiber (g)<input id="q_fib" type="number" inputmode="decimal" value="${m.qFib || ''}"></label></div>
           <button class="pri" style="width:100%" onclick="A.commitQuick()">${m.editId ? 'Update entry' : 'Add to ' + esc(m.meal)}</button>
           ${m.editId ? `<button class="bad ghost" style="width:100%;margin-top:6px" onclick="A.delEntry('${m.editId}')">Delete entry</button>` : ''}`;
@@ -665,7 +761,7 @@
     }
 
     if (m.type === 'checkin') {
-      const ci = C.weeklyCheckIn(S.profile, S.goal, S.weights, S.logs, FOOD, S.plan);
+      const ci = C.weeklyCheckIn(S.profile, S.goal, S.weights, S.logs, FOOD, S.plan, coachOpts());
       const sign = ci.diffKcal > 0 ? '+' : '';
       return `<div class="modal" onclick="if(event.target===this)A.closeModal()"><div class="sheet">
         <div class="row" style="margin-bottom:10px"><b class="sp" style="font-size:19px">Weekly Check-In</b><span class="chip sel num">TDEE ${ci.exp.tdee}</span></div>
@@ -679,7 +775,7 @@
             <div class="kpi"><div class="k-lbl">Fat</div><div class="k-val" style="color:var(--f-col)">${ci.proposed.f}g</div></div>
           </div>
         </div>
-        <div class="g2"><button onclick="A.closeModal()">Keep current</button><button class="pri" onclick="A.applyCheckIn()">Apply update</button></div>
+        <div class="g2"><button onclick="A.keepCheckIn()">Keep current</button><button class="pri" onclick="A.applyCheckIn()">Apply update</button></div>
       </div></div>`;
     }
 
@@ -711,6 +807,7 @@
       const f = m.food;
       return `<div class="modal" onclick="if(event.target===this)A.closeModal()"><div class="sheet">
         <b style="font-size:19px;display:block;margin-bottom:10px">${m.id ? 'Edit' : 'New'} food (per 100g)</b>
+        ${m.id ? '<div class="xs mut" style="margin:-4px 0 10px">Edits apply to future logs only — past entries keep the values they were logged with.</div>' : ''}
         <input id="fe_name" placeholder="Food name" value="${esc(f.name)}" style="margin-bottom:8px">
         <div class="g3" style="margin-bottom:8px">
           <label class="xs mut">Category<select id="fe_cat">${C.CATS.map(c => `<option ${c === f.cat ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
@@ -728,6 +825,11 @@
           <label class="xs mut">Sodium (mg)<input id="fe_na" type="number" step="any" value="${f.na}"></label>
           <label class="xs mut">Potassium (mg)<input id="fe_k" type="number" step="any" value="${f.k}"></label>
         </div>
+        <div class="g3" style="margin:-4px 0 12px">
+          <label class="xs mut">Calcium (mg)<input id="fe_ca" type="number" step="any" value="${f.ca || 0}"></label>
+          <label class="xs mut">Iron (mg)<input id="fe_fe" type="number" step="any" value="${f.fe || 0}"></label>
+          <label class="xs mut">Vitamin D (mcg)<input id="fe_vd" type="number" step="any" value="${f.vitd || 0}"></label>
+        </div>
         <div class="g2">${m.id ? '<button class="bad" onclick="A.delFood()">Delete</button>' : '<button onclick="A.closeModal()">Cancel</button>'}<button class="pri" onclick="A.saveFood()">Save</button></div>
       </div></div>`;
     }
@@ -740,13 +842,14 @@
           <label class="xs mut">Meal name<input value="${esc(rc.name)}" placeholder="e.g. Post-Workout Bowl" oninput="A.rcField('name',this.value)"></label>
           <label class="xs mut">Servings<input type="number" min="1" value="${rc.servings}" oninput="A.rcField('servings',Math.max(1,+this.value||1))"></label>
         </div>
-        <div class="xs mut num" style="margin-bottom:10px">Per serving: <b style="color:var(--tx)">${r0(tot.kcal)} kcal</b> · P ${r0(tot.p)}g · C ${r0(tot.c)}g · F ${r0(tot.f)}g</div>
+        <div id="rc_tot" class="xs mut num" style="margin-bottom:10px">${rcTotHTML(rc)}</div>
         <div class="card" style="padding:8px 12px">
           ${rc.items.map((it, idx) => {
             const f = FOOD[it.foodId];
             return `<div class="row" style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="sp sm">${esc(f ? f.name : '?')}</span><input type="number" style="width:74px;min-height:34px;padding:4px 6px;text-align:center" value="${it.grams}" oninput="A.rcGrams(${idx},this.value)"><span class="xs mut">g</span><button class="ico ghost bad" onclick="A.rcDelItem(${idx})">✕</button></div>`;
           }).join('') || '<div class="mut xs" style="padding:8px 0">Add ingredients below</div>'}
-          <div class="row" style="margin-top:8px"><select id="rc_add_sel">${S.foods.map(f => `<option value="${f.id}">${esc(f.name)} (${f.srvG}g)</option>`).join('')}</select><button class="sm" onclick="A.rcAddItem()">+ Add</button></div>
+          <input id="rc_q" placeholder="Search foods to add…" value="${esc(m.rq || '')}" style="margin-top:8px" oninput="A.rcQ(this.value)">
+          <div id="rc_hits">${rcHitsHTML()}</div>
         </div>
         <div class="g2" style="margin-top:12px">${m.id ? '<button class="bad" onclick="A.delRecipe()">Delete</button>' : '<button onclick="A.closeModal()">Cancel</button>'}<button class="pri" onclick="A.saveRecipe()">Save meal</button></div>
       </div></div>`;
@@ -754,16 +857,42 @@
     return '';
   }
 
+  const rcTotHTML = (rc) => { const t = C.recipeTotals(rc, FOOD).perServing; return `Per serving: <b style="color:var(--tx)">${r0(t.kcal)} kcal</b> · P ${r0(t.p)}g · C ${r0(t.c)}g · F ${r0(t.f)}g`; };
+  function rcHitsHTML() {
+    const q = ((ui.modal && ui.modal.rq) || '').toLowerCase().trim();
+    if (!q) return '<div class="xs dim" style="padding:6px 2px">Type to find an ingredient</div>';
+    const hits = visibleFoods().filter(f => f.name.toLowerCase().includes(q)).slice(0, 12);
+    return hits.map(f => `<div class="li" onclick="A.rcAddItem('${f.id}')"><div class="sp sm">${esc(f.name)}</div><span class="xs mut">${f.srvG}g</span><span class="chip sel">+</span></div>`).join('') || '<div class="xs mut" style="padding:6px 2px">No local match — add it via the Log tab search or Data → + Food.</div>';
+  }
+
+  function foodRow(f) {
+    const n = C.foodNutrients(f, f.srvG);
+    return `<div class="li" onclick="A.pickFood('${f.id}')"><div class="sp"><div class="sm">${f.fav ? '<span class="fav">★</span> ' : ''}${esc(f.name)}</div><div class="xs mut num">${esc(f.srvLabel)} · P ${r0(n.p)} · C ${r0(n.c)} · F ${r0(n.f)}</div></div><b class="sm num">${r0(n.kcal)}</b></div>`;
+  }
   function foodPickList() {
-    const m = ui.modal, q = (m.q || '').toLowerCase();
-    const hits = S.foods.filter(f => (!m.cat || f.cat === m.cat) && f.name.toLowerCase().includes(q)).slice(0, 45);
+    const m = ui.modal, q = (m.q || '').toLowerCase().trim();
+    // Empty search: Favorites → Recent → Frequent → everything else (deduped)
+    if (!q && !m.cat) {
+      const rf = C.recentFoods(S.logs);
+      const ok = (f) => f && !f.hidden;
+      const used = new Set();
+      const sec = (title, list) => {
+        list = list.filter(f => ok(f) && !used.has(f.id));
+        list.forEach(f => used.add(f.id));
+        return list.length ? `<div class="sec-h">${title}</div>` + list.map(foodRow).join('') : '';
+      };
+      const out = sec('★ Favorites', visibleFoods().filter(f => f.fav))
+        + sec('Recent', rf.recent.map(id => FOOD[id]))
+        + sec('Frequent', rf.frequent.map(id => FOOD[id]));
+      return out + sec(out ? 'All foods' : 'Foods', visibleFoods().slice(0, 40));
+    }
+    const hits = visibleFoods().filter(f => (!m.cat || f.cat === m.cat) && f.name.toLowerCase().includes(q))
+      .sort((a, b) => (b.fav ? 1 : 0) - (a.fav ? 1 : 0) || (a.name.toLowerCase().startsWith(q) ? 0 : 1) - (b.name.toLowerCase().startsWith(q) ? 0 : 1))
+      .slice(0, 45);
     if (!hits.length) {
       return `<div class="mut sm" style="padding:12px 0">No local match. <a href="#" onclick="A.setAddSrc('off');A.runOnlineSearch();return false">Search Open Food Facts →</a></div>`;
     }
-    return hits.map(f => {
-      const n = C.foodNutrients(f, f.srvG);
-      return `<div class="li" onclick="A.pickFood('${f.id}')"><div class="sp"><div class="sm">${esc(f.name)}</div><div class="xs mut num">${esc(f.srvLabel)} · P ${r0(n.p)} · C ${r0(n.c)} · F ${r0(n.f)}</div></div><b class="sm num">${r0(n.kcal)}</b></div>`;
-    }).join('');
+    return hits.map(foodRow).join('');
   }
 
   function onlinePickList() {
@@ -787,7 +916,7 @@
 
   window.ui_hideTip = () => { ui.tipHidden = true; render(); };
   window.ui_toggleMicros = () => { ui.microsOpen = !ui.microsOpen; render(); };
-  window.ui_foodQ = (v) => { ui.foodQ = v; render(); };
+  window.ui_foodQ = (v) => { ui.foodQ = v; const el = $('#lib_list'); if (el) el.innerHTML = libListHTML(); else render(); }; // keep keyboard up
   window.ui_foodCat = (c) => { ui.foodCat = c; render(); };
 
   // ---------- actions ----------
@@ -796,7 +925,10 @@
     reRender: render,
     shiftDay(d) { ui.date = C.addDays(ui.date, d); render(); },
     toggleRem() { S.settings.showRemaining = !S.settings.showRemaining; save(); render(); },
-    addWater(oz) { S.water[ui.date] = Math.max(0, (S.water[ui.date] || 0) + oz); save(); render(); },
+    addWater(dir) { S.water[ui.date] = Math.max(0, r2((S.water[ui.date] || 0) + dir * waterStep())); save(); render(); },
+    dayMeta(v) { if (v) S.dayMeta[ui.date] = v; else delete S.dayMeta[ui.date]; save(); render(); },
+    setMeal(v) { if (ui.modal) ui.modal.meal = v; },
+    toggleFav(id) { const f = FOOD[id]; if (!f) return; f.fav = !f.fav; save(); render(); },
     copyYesterday() {
       const yk = C.addDays(ui.date, -1), prev = S.logs[yk] || [];
       if (!prev.length) { toast('Nothing logged yesterday'); return; }
@@ -892,8 +1024,8 @@
       const grams = m.unitMode === 'srv' ? m.qty * f.srvG : m.qty;
       if (!(grams > 0)) { toast('Enter an amount > 0'); return; }
       const list = S.logs[ui.date] || (S.logs[ui.date] = []);
-      if (m.editId) { const ex = list.find(e => e.id === m.editId); if (ex) { ex.foodId = f.id; ex.grams = r1(grams); } }
-      else list.push({ id: C.uid(), meal: m.meal, foodId: f.id, grams: r1(grams) });
+      if (m.editId) { const ex = list.find(e => e.id === m.editId); if (ex) Object.assign(ex, { meal: m.meal, foodId: f.id, grams: r1(grams), snap: C.snapFood(f) }); }
+      else list.push({ id: C.uid(), meal: m.meal, foodId: f.id, grams: r1(grams), snap: C.snapFood(f) });
       save(); ui.modal = null; render();
     },
     commitQuick() {
@@ -902,12 +1034,14 @@
       if (!(calcKcal > 0)) { toast('Enter calories or macros'); return; }
       const name = $('#q_name').value.trim() || 'Quick Add';
       const list = S.logs[ui.date] || (S.logs[ui.date] = []);
-      if (m.editId) { const ex = list.find(e => e.id === m.editId); if (ex) Object.assign(ex, { name, kcal: calcKcal, p, c, f, fiber }); }
+      if (m.editId) { const ex = list.find(e => e.id === m.editId); if (ex) Object.assign(ex, { meal: m.meal, name, kcal: calcKcal, p, c, f, fiber }); }
       else list.push({ id: C.uid(), meal: m.meal, quick: true, name, kcal: calcKcal, p, c, f, fiber });
       save(); ui.modal = null; render();
     },
     editEntry(id) {
       const e = (S.logs[ui.date] || []).find(x => x.id === id); if (!e) return;
+      // Entry whose food was hard-deleted in an older build: rebuild a hidden food from its snapshot
+      if (!e.quick && !FOOD[e.foodId] && e.snap) { S.foods.push(Object.assign({ id: e.foodId, cat: 'Other', srvLabel: '100 g', srvG: 100, hidden: true }, e.snap)); save(); reindex(); }
       if (e.quick) ui.modal = { type: 'add', meal: e.meal, sub: 'quick', editId: id, qName: e.name, qKcal: e.kcal, qP: e.p, qC: e.c, qF: e.f, qFib: e.fiber };
       else ui.modal = { type: 'add', meal: e.meal, sub: 'foods', src: 'local', editId: id, picked: e.foodId, qty: e.grams, unitMode: 'g' };
       render();
@@ -917,10 +1051,10 @@
       const rc = S.recipes.find(r => r.id === rcId); if (!rc) return;
       const list = S.logs[ui.date] || (S.logs[ui.date] = []);
       const div = Math.max(1, rc.servings || 1);
-      rc.items.forEach(it => list.push({ id: C.uid(), meal: meal || 'Lunch', foodId: it.foodId, grams: r1(it.grams / div) }));
+      rc.items.forEach(it => { const f = FOOD[it.foodId]; if (f) list.push({ id: C.uid(), meal: meal || defaultMeal(), foodId: it.foodId, grams: r1(it.grams / div), snap: C.snapFood(f) }); });
       save(); ui.modal = null; toast(`Logged ${rc.name}`); render();
     },
-    quickLogRecipe(rcId) { A.logRecipe(rcId, 'Lunch'); ui.tab = 'log'; render(); },
+    quickLogRecipe(rcId) { A.logRecipe(rcId, defaultMeal()); ui.tab = 'log'; render(); },
 
     // --- Goal Wizard & Weekly Check-In
     startWiz(editing) {
@@ -955,7 +1089,11 @@
     wizF(k, v) { ui.wiz[k] = v; },
     wizHeight(v) { const n = parseFloat(v); if (n > 0) ui.wiz.heightIn = S.settings.unit === 'kg' ? n / C.CM_PER_IN : n; },
     wizWeight(k, v) { const n = parseFloat(v); if (n > 0) ui.wiz[k] = C.toLb(n, S.settings.unit); },
-    wizRate(v) { ui.wiz.ratePctWk = v; ui.wiz.targetDate = ''; render(); },
+    wizRate(v) { // live label only — a full render mid-drag would replace the slider and kill the gesture
+      ui.wiz.ratePctWk = v; ui.wiz.targetDate = '';
+      const l = $('#wiz_rate'); if (l) l.textContent = rateLabel(ui.wiz);
+      const d = $('#wiz_date'); if (d) d.value = '';
+    },
     wizDate(dk) {
       ui.wiz.targetDate = dk;
       if (dk && ui.wiz.mode !== 'maintain' && ui.wiz.targetWeightLb > 0) {
@@ -969,14 +1107,15 @@
       S.profile = { sex: w.sex, age: w.age, heightIn: w.heightIn, startWeightLb: w.startWeightLb, bfPct: w.bfPct, activity: w.activity };
       S.goal = { mode: w.mode, targetWeightLb: w.targetWeightLb, ratePctWk: w.ratePctWk, targetDate: w.targetDate, protTier: w.protTier, split: w.split, startedAt: Date.now() };
       if (!S.weights.length) S.weights.push({ id: C.uid(), date: C.dateKey(), weightLb: r1(w.startWeightLb), bf: w.bfPct || '', note: 'Starting weight' });
-      const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD);
+      const exp = C.estimateExpenditure(S.profile, S.weights, S.logs, FOOD, coachOpts());
       S.plan = C.buildPlan(S.profile, S.goal, exp.tdee, w.startWeightLb, w.bfPct);
       S.lastCheckIn = Date.now();
       ui.wiz = null; ui.tab = 'log'; save(); toast('Nutrition plan ready'); render(); window.scrollTo(0, 0);
     },
     openCheckIn() { if (!S.goal) { A.startWiz(); return; } ui.modal = { type: 'checkin' }; render(); },
+    keepCheckIn() { S.lastCheckIn = Date.now(); save(); ui.modal = null; toast('Targets unchanged'); render(); },
     applyCheckIn() {
-      const ci = C.weeklyCheckIn(S.profile, S.goal, S.weights, S.logs, FOOD, S.plan);
+      const ci = C.weeklyCheckIn(S.profile, S.goal, S.weights, S.logs, FOOD, S.plan, coachOpts());
       S.plan = ci.proposed; S.lastCheckIn = Date.now();
       save(); ui.modal = null; toast(`Updated to ${ci.proposed.kcal} kcal/day`); render();
     },
@@ -985,8 +1124,8 @@
     openWeigh(id) {
       const ex = id ? S.weights.find(x => x.id === id) : null;
       const last = S.weights.slice().sort((a, b) => b.date.localeCompare(a.date))[0];
-      const w = ex ? { date: ex.date, weightDisp: dispW(ex.weightLb), bf: ex.bf || '', waist: ex.waist || '', neck: ex.neck || '', chest: ex.chest || '', arms: ex.arms || '', hips: ex.hips || '', note: ex.note || '' }
-        : { date: C.dateKey(), weightDisp: last ? dispW(last.weightLb) : dispW(S.profile.startWeightLb), bf: '', waist: last?.waist || '', neck: last?.neck || '', chest: '', arms: '', hips: last?.hips || '', note: '' };
+      const w = ex ? { date: ex.date, weightDisp: dispW(ex.weightLb), bf: ex.bf || '', waist: dispL(ex.waist), neck: dispL(ex.neck), chest: dispL(ex.chest), arms: dispL(ex.arms), hips: dispL(ex.hips), note: ex.note || '' }
+        : { date: ui.date <= C.dateKey() ? ui.date : C.dateKey(), weightDisp: last ? dispW(last.weightLb) : dispW(S.profile.startWeightLb), bf: '', waist: dispL(last?.waist), neck: dispL(last?.neck), chest: '', arms: '', hips: dispL(last?.hips), note: '' };
       ui.modal = { type: 'weigh', id: id || null, entry: w }; render();
     },
     calcNavy() {
@@ -998,17 +1137,15 @@
       $('#w_bf').value = bf; toast(`Estimated ${bf}% body fat`);
     },
     saveWeigh() {
+      const inch = (sel) => { const v = parseFloat($(sel).value); return v > 0 ? r2(C.toIn(v, S.settings.unit)) : ''; };
       const wt = parseFloat($('#w_wt').value);
       if (!(wt > 0)) { toast('Enter a valid weight'); return; }
       const obj = {
         id: ui.modal.id || C.uid(), date: $('#w_date').value || C.dateKey(),
         weightLb: r1(C.toLb(wt, S.settings.unit)),
         bf: $('#w_bf').value ? r1(parseFloat($('#w_bf').value)) : '',
-        waist: $('#w_waist').value ? r1(parseFloat($('#w_waist').value)) : '',
-        neck: $('#w_neck').value ? r1(parseFloat($('#w_neck').value)) : '',
-        chest: $('#w_chest').value ? r1(parseFloat($('#w_chest').value)) : '',
-        arms: $('#w_arms').value ? r1(parseFloat($('#w_arms').value)) : '',
-        hips: $('#w_hips').value ? r1(parseFloat($('#w_hips').value)) : '',
+        // tape measurements stored in inches regardless of display unit
+        waist: inch('#w_waist'), neck: inch('#w_neck'), chest: inch('#w_chest'), arms: inch('#w_arms'), hips: inch('#w_hips'),
         note: $('#w_note').value.trim(),
       };
       if (ui.modal.id) { const idx = S.weights.findIndex(x => x.id === ui.modal.id); if (idx >= 0) S.weights[idx] = obj; }
@@ -1022,12 +1159,13 @@
       const rc = id ? clone(S.recipes.find(r => r.id === id)) : { id: C.uid(), name: '', servings: 1, items: [] };
       ui.modal = { type: 'recipe', id: id || null, rc }; render();
     },
-    rcField(k, v) { ui.modal.rc[k] = v; },
-    rcAddItem() {
-      const fid = $('#rc_add_sel').value, f = FOOD[fid]; if (!f) return;
-      ui.modal.rc.items.push({ foodId: fid, grams: f.srvG }); render();
+    rcField(k, v) { ui.modal.rc[k] = v; const t = $('#rc_tot'); if (t) t.innerHTML = rcTotHTML(ui.modal.rc); },
+    rcQ(v) { ui.modal.rq = v; const el = $('#rc_hits'); if (el) el.innerHTML = rcHitsHTML(); },
+    rcAddItem(fid) {
+      const f = FOOD[fid]; if (!f) return;
+      ui.modal.rc.items.push({ foodId: fid, grams: f.srvG }); ui.modal.rq = ''; render();
     },
-    rcGrams(i, v) { ui.modal.rc.items[i].grams = Math.max(0, parseFloat(v) || 0); },
+    rcGrams(i, v) { ui.modal.rc.items[i].grams = Math.max(0, parseFloat(v) || 0); const t = $('#rc_tot'); if (t) t.innerHTML = rcTotHTML(ui.modal.rc); },
     rcDelItem(i) { ui.modal.rc.items.splice(i, 1); render(); },
     saveRecipe() {
       const rc = ui.modal.rc;
@@ -1048,7 +1186,7 @@
       const f = {
         id: ui.modal.id || ('u_' + C.uid()), name, cat: $('#fe_cat').value, srvLabel: $('#fe_sl').value.trim() || '100 g',
         srvG: Math.max(1, +$('#fe_sg').value || 100), kcal: +$('#fe_kcal').value || 0, p: +$('#fe_p').value || 0, c: +$('#fe_c').value || 0, f: +$('#fe_f').value || 0,
-        fiber: +$('#fe_fib').value || 0, na: +$('#fe_na').value || 0, k: +$('#fe_k').value || 0, ca: ui.modal.food.ca || 0, fe: ui.modal.food.fe || 0, vitd: ui.modal.food.vitd || 0,
+        fiber: +$('#fe_fib').value || 0, na: +$('#fe_na').value || 0, k: +$('#fe_k').value || 0, ca: +$('#fe_ca').value || 0, fe: +$('#fe_fe').value || 0, vitd: +$('#fe_vd').value || 0,
       };
       if (ui.modal.id) Object.assign(FOOD[ui.modal.id], f); else S.foods.push(f);
       save(); reindex();
@@ -1056,7 +1194,11 @@
       if (ui.modal) { ui.modal.picked = f.id; ui.modal.qty = 1; ui.modal.unitMode = 'srv'; }
       toast('Food saved'); render();
     },
-    delFood() { if (confirm('Delete this food?')) { S.foods = S.foods.filter(f => f.id !== ui.modal.id); save(); ui.modal = null; render(); } },
+    delFood() { // soft delete: hidden from lists, still resolvable by past entries and saved meals
+      if (!confirm('Remove this food from your library? Past logs keep their values.')) return;
+      const f = FOOD[ui.modal.id]; if (f) { f.hidden = true; f.fav = false; }
+      save(); ui.modal = null; toast('Food removed'); render();
+    },
     closeModal() { stopScanner(); ui.modal = null; render(); },
 
     // --- Data / Settings
@@ -1064,7 +1206,10 @@
     setWaterGoal(v) { const n = +v || 0; S.settings.waterGoalOz = S.settings.waterUnit === 'ml' ? r0(n / 29.5735) : r0(n); save(); render(); },
     expDiaryCSV() { shareOrDownload('openmacros-diary-' + C.dateKey() + '.csv', C.diaryToCSV(S.logs, FOOD), 'text/csv'); render(); },
     expBioCSV() { shareOrDownload('openmacros-body-' + C.dateKey() + '.csv', C.biometricsToCSV(S.weights, S.settings.unit), 'text/csv'); render(); },
-    expJSON() { shareOrDownload('openmacros-backup-' + C.dateKey() + '.json', JSON.stringify(S), 'application/json'); render(); },
+    expJSON() { // API key stays on this device — never in backup files
+      const out = clone(S); out.settings.usdaKey = '';
+      shareOrDownload('openmacros-backup-' + C.dateKey() + '.json', JSON.stringify(out), 'application/json'); render();
+    },
     restore(inp) {
       const f = inp.files[0]; inp.value = ''; if (!f) return;
       const rd = new FileReader();
@@ -1073,13 +1218,27 @@
           const j = JSON.parse(rd.result);
           if (!j || !j.v || !Array.isArray(j.foods) || typeof j.logs !== 'object') throw new Error('Not an openMACROS backup');
           if (!confirm('Restore this backup? Everything currently on this device will be replaced.')) return;
-          S = Object.assign(fresh(), j); save(); reindex(); ui.tab = 'log'; render(); toast('Backup restored');
+          const key = S.settings.usdaKey;
+          S = migrate(j); if (!S.settings.usdaKey) S.settings.usdaKey = key;
+          save(); reindex(); ui.tab = 'log'; ui.date = C.dateKey(); render(); toast('Backup restored');
         } catch (e) { alert('Restore failed: ' + e.message); }
       };
       rd.readAsText(f);
     },
     reset() { if (confirm('Erase ALL openMACROS data on this device?') && confirm('Really erase everything?')) { S = fresh(); save(); reindex(); render(); } },
   };
+
+  // Midnight rollover: a home-screen app resumed the next morning should log to the new day
+  let lastToday = C.dateKey();
+  function checkRollover() {
+    const t = C.dateKey();
+    if (t === lastToday) return;
+    if (ui.date === lastToday) { ui.date = t; if (!ui.modal) render(); } // don't tear down an open sheet/scanner
+    lastToday = t;
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkRollover(); });
+  window.addEventListener('pageshow', checkRollover);
+  setInterval(checkRollover, 60000);
 
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => { });
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
