@@ -271,6 +271,23 @@ a{color:var(--acc-hi);text-decoration:none}
 .sec-h{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);font-weight:600;padding:10px 2px 2px}
 .fav{color:var(--warn)}
 button.star{min-height:34px;width:34px;padding:0;border-radius:9px;font-size:16px;color:var(--dim)}
+.sheet.tour{padding-bottom:calc(20px + env(safe-area-inset-bottom));touch-action:pan-y;display:flex;flex-direction:column;min-height:min(560px,86vh)}
+.sheet.tour .tour-step{flex:1}
+.tour-step{animation:tourIn .28s var(--ease) both;padding:6px 2px 4px}
+@keyframes tourIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.tour-ic{width:52px;height:52px;border-radius:16px;background:var(--acc-soft);border:1px solid rgba(139,116,189,.3);color:var(--acc-hi);display:flex;align-items:center;justify-content:center;margin:6px 0 14px}
+.tour-ic svg{width:26px;height:26px}
+.tour-h{display:block;font-size:22px;letter-spacing:-.01em;line-height:1.2}
+.tour-p{margin:8px 0 14px;line-height:1.5}
+.tour-demo{pointer-events:none;margin-bottom:14px}
+.tour-loop .kpi{text-align:center}
+.tour-pts{list-style:none;margin:0 0 4px;padding:0}
+.tour-pts li{position:relative;padding:0 0 9px 18px;font-size:13.5px;line-height:1.45;color:var(--tx)}
+.tour-pts li::before{content:"";position:absolute;left:3px;top:7px;width:6px;height:6px;border-radius:99px;background:var(--acc)}
+.tour-dots{display:flex;justify-content:center;gap:6px;margin:12px 0 14px}
+.tour-dots i{width:6px;height:6px;border-radius:99px;background:var(--line2);transition:width .2s var(--ease),background .2s}
+.tour-dots i.on{width:18px;background:var(--acc-hi)}
+button:disabled{opacity:.35;pointer-events:none}
 button.star.on{color:var(--warn);border-color:rgba(217,180,100,.35);background:var(--warn-bg)}
 </style>
 </head>

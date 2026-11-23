@@ -32,6 +32,7 @@ icon-180/192/512.png          home screen icons
   recipes:  [ { id, name, servings, items: [ { foodId, grams } ] } ],
   logs:     { 'YYYY-MM-DD': [ { id, meal, foodId, grams, snap } | { id, meal, quick: true, name, kcal, p, c, f, fiber } ] },
   dayMeta:  { 'YYYY-MM-DD': 'done' | 'skip' },     // coaching overrides
+  tutorialSeen: 1,                                  // TUTORIAL_V last completed or skipped
   water:    { 'YYYY-MM-DD': oz },
   weights:  [ { id, date, weightLb, bf, waist, neck, chest, arms, hips, note } ],  // tape measurements in inches
 }
@@ -72,6 +73,10 @@ node --test
 ```
 
 ## Changelog
+
+### v2.2 — 2026-11-22
+- **First-run tutorial:** 5-step swipeable walkthrough (welcome loop → logging → coaching days → weigh-ins/check-ins → backups), opening on top of the relevant tab. On iPhone Safari it leads with an *Install it first* step, since Safari and the home-screen app keep separate data. Finishing without a goal goes straight into goal setup.
+- Shown when `tutorialSeen < TUTORIAL_V` (state field, travels with backups). Existing users with data are marked seen on upgrade; *Erase all data* shows it again; replay from Data → Settings. Bump `TUTORIAL_V` in `app.js` to re-show it after a major feature.
 
 ### v2.1 — 2026-11-22
 - **Data integrity:** log entries store a nutrient snapshot; food edits/deletes no longer change past days. Foods are soft-deleted. Tapping an entry whose food is missing no longer crashes the app.

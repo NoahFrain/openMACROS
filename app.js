@@ -3,9 +3,11 @@
   'use strict';
   const C = window.Core;
   const KEY = 'openmacros.v1';
-  const BUILD = 'v2.1 · 2026-11-22';
+  const BUILD = 'v2.2 · 2026-11-22';
   const SV = 2; // state schema version (storage KEY stays stable so existing data carries over)
   const MKEYS = ['waist', 'neck', 'chest', 'arms', 'hips']; // tape measurements, stored in inches
+  // First-run tutorial. Bump to re-show it to everyone after a major feature (and update tourSteps).
+  const TUTORIAL_V = 1;
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const r0 = (x) => Math.round(+x || 0);
@@ -38,6 +40,7 @@
       weights: [],
       dayMeta: {},
       lastBackup: null,
+      tutorialSeen: 0, // TUTORIAL_V last completed/skipped on this device
     };
   }
   /** Normalize any stored/restored state to the current schema */
@@ -47,6 +50,11 @@
     m.settings = Object.assign(fresh().settings, j.settings || {});
     m.profile = Object.assign(fresh().profile, j.profile || {});
     m.dayMeta = j.dayMeta || {};
+    // Existing users upgrading (or restoring a pre-tutorial backup) with real data skip the first-run tour
+    if (j.tutorialSeen == null) {
+      const hasData = Object.keys(j.logs || {}).length || (j.weights || []).length || j.goal;
+      m.tutorialSeen = hasData ? TUTORIAL_V : 0;
+    }
     m.foods = Array.isArray(j.foods) ? j.foods : C.seedFoods();
     // New seed foods from later builds appear without touching user edits
     const have = new Set(m.foods.map(f => f.id));
@@ -660,6 +668,7 @@
         <label class="xs mut">Water unit<select onchange="A.setting('waterUnit',this.value)"><option value="oz" ${S.settings.waterUnit === 'oz' ? 'selected' : ''}>oz</option><option value="ml" ${S.settings.waterUnit === 'ml' ? 'selected' : ''}>ml</option></select></label>
       </div>
       <label class="xs mut">Daily water goal (${S.settings.waterUnit})<input type="number" inputmode="numeric" value="${S.settings.waterUnit === 'ml' ? Math.round(S.settings.waterGoalOz * 29.5735) : S.settings.waterGoalOz}" onchange="A.setWaterGoal(this.value)"></label>
+      <button style="width:100%;margin-top:12px" onclick="A.startTour()">Replay tutorial</button>
     </div>`;
 
     h += `<h2>Food library (${visibleFoods().length})</h2><div class="card">
@@ -680,9 +689,78 @@
     return (rows || '<div class="mut sm" style="padding:10px 0">No matching foods.</div>') + (flist.length > 80 ? `<div class="xs dim" style="padding:8px 2px">Showing 80 of ${flist.length} — refine the filter.</div>` : '');
   }
 
+  // ---------- First-run tutorial ----------
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = () => !!(window.navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches));
+  const TI = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+  function tourSteps() {
+    const steps = [];
+    // iPhone Safari: storage is separate from the home-screen app, so install before logging anything
+    if (isIOS && !isStandalone()) steps.push({
+      tab: 'log', icon: TI('<path d="M12 3v12M8 7l4-4 4 4"/><rect x="4" y="11" width="16" height="10" rx="2.5"/>'),
+      title: 'Install it first',
+      body: 'Tap <b>Share</b> → <b>Add to Home Screen</b>, then open openMACROS from your home screen.',
+      points: ['Runs full-screen and works offline', 'Safari and the home-screen app keep <b>separate data</b> — anything logged here won\'t carry over'],
+      next: 'Continue in Safari',
+    });
+    steps.push({
+      tab: 'log', icon: TI('<circle cx="12" cy="12" r="8.5"/><path d="M8.5 12.5l2.3 2.3 4.7-5"/>'),
+      title: 'Welcome to openMACROS',
+      body: 'Calorie and macro targets that adapt to what your body actually does — not a formula guess.',
+      demo: `<div class="g3 tour-loop"><div class="kpi"><div class="xs dim">1 · Daily</div><b class="sm">Log food</b></div><div class="kpi"><div class="xs dim">2 · Daily</div><b class="sm">Weigh in</b></div><div class="kpi"><div class="xs dim">3 · Weekly</div><b class="sm">Check in</b></div></div>`,
+      points: ['The more consistently you log and weigh in, the sharper your targets get'],
+    });
+    steps.push({
+      tab: 'log', icon: TI('<path d="M4 6h16M4 12h16M4 18h10"/><circle cx="18.5" cy="18" r="2.5"/>'),
+      title: 'Logging food',
+      body: 'Tap <b>+ Add</b> on any meal, or <b>Scan</b> a barcode from the top bar.',
+      demo: `<div class="card" style="margin:0;padding:10px 12px"><div class="sec-h" style="padding-top:0">★ Favorites</div><div class="li"><div class="sp sm"><span class="fav">★</span> Chicken Breast (Cooked)</div><b class="sm num">186</b></div><div class="sec-h">Recent</div><div class="li"><div class="sp sm">Rolled Oats (Dry)</div><b class="sm num">150</b></div></div>`,
+      points: ['Search your library, Open Food Facts, or USDA', 'Star foods you eat often — favorites and recents sit at the top', '<b>Copy yesterday</b> and <b>Saved Meals</b> for repeat days'],
+    });
+    steps.push({
+      tab: 'log', icon: TI('<path d="M4 19h16M5 15l4.5-4.5 3.5 3 6-7"/><path d="M15.5 6.5H19V10"/>'),
+      title: 'Complete days drive coaching',
+      body: 'Your expenditure is estimated from intake vs. weight trend — so only finished, fully logged days count.',
+      demo: `<div class="card" style="margin:0;padding:10px 12px"><div class="row" style="gap:6px"><b class="sm">Coaching data</b><span class="chip ok-chip">Counted</span><span class="chip warn-chip">Partial</span></div><div class="xs mut" style="margin-top:4px">Bottom of each day on the Log tab</div></div>`,
+      points: ['Today never counts until it ends', 'Days under 50% of target are treated as partial and skipped', 'Use <b>Mark complete</b> for a real low day, <b>Exclude</b> for a day you didn\'t track'],
+    });
+    steps.push({
+      tab: 'body', icon: TI('<rect x="4" y="4" width="16" height="16" rx="4"/><path d="M8.5 10a5 5 0 0 1 7 0M12 10l1.5-2"/>'),
+      title: 'Weigh in, then check in',
+      body: 'Weigh in most mornings from the <b>Body</b> tab. Daily noise gets smoothed into a trend.',
+      demo: `<div class="card notice row" style="margin:0"><div class="sp"><b class="sm">Weekly check-in ready</b><div class="xs mut">Review adaptive expenditure &amp; update targets</div></div><span class="chip sel">Check in</span></div>`,
+      points: ['Every 7 days, review the update and <b>Apply</b> or <b>Keep current</b>', 'Waist, neck and other measurements are optional'],
+    });
+    steps.push({
+      tab: 'data', icon: TI('<ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3V6"/><path d="M4.5 12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3"/>'),
+      title: 'Your data lives on this phone',
+      body: 'No account, no cloud. Back up from the <b>Data</b> tab so a reset or new phone doesn\'t cost you your history.',
+      points: ['<b>Backup JSON</b> restores everything; CSVs are for spreadsheets', 'You\'ll get a reminder if it\'s been 14+ days', 'Replay this tour anytime from Data → Settings'],
+    });
+    return steps;
+  }
+  function tourHTML(m) {
+    const steps = tourSteps();
+    const i = C.clamp(m.i || 0, 0, steps.length - 1), st = steps[i], last = i === steps.length - 1;
+    const cta = last ? (S.goal ? 'Start logging' : 'Set my goal') : (st.next || 'Next');
+    return `<div class="modal"><div class="sheet tour" ontouchstart="ui_tourT(event,0)" ontouchend="ui_tourT(event,1)">
+      <div class="row" style="margin-bottom:4px"><span class="xs dim num sp">${i + 1} of ${steps.length}</span><button class="sm ghost" onclick="A.endTour(false)">Skip</button></div>
+      <div class="tour-step" key="${i}">
+        <div class="tour-ic">${st.icon}</div>
+        <b class="tour-h">${st.title}</b>
+        <p class="sm mut tour-p">${st.body}</p>
+        ${st.demo ? `<div class="tour-demo" aria-hidden="true">${st.demo}</div>` : ''}
+        ${st.points ? `<ul class="tour-pts">${st.points.map(x => `<li>${x}</li>`).join('')}</ul>` : ''}
+      </div>
+      <div class="tour-dots">${steps.map((_, k) => `<i class="${k === i ? 'on' : ''}"></i>`).join('')}</div>
+      <div class="g2"><button ${i === 0 ? 'disabled' : ''} onclick="A.tourStep(-1)">Back</button><button class="pri" onclick="${last ? 'A.endTour(true)' : 'A.tourStep(1)'}">${cta}</button></div>
+    </div></div>`;
+  }
+
   // ---------- Modals ----------
   function modalHTML() {
     const m = ui.modal;
+    if (m.type === 'tour') return tourHTML(m);
     if (m.type === 'scan') {
       return `<div class="modal" onclick="if(event.target===this)A.closeModal()"><div class="sheet">
         <div class="row" style="margin-bottom:10px"><b class="sp" style="font-size:17px">Scan Barcode / QR</b>
@@ -915,6 +993,14 @@
   }
 
   window.ui_hideTip = () => { ui.tipHidden = true; render(); };
+  let tourX = null, tourY = null;
+  window.ui_tourT = (e, end) => { // horizontal swipe between tour steps
+    const t = e.changedTouches && e.changedTouches[0]; if (!t) return;
+    if (!end) { tourX = t.clientX; tourY = t.clientY; return; }
+    if (tourX == null) return;
+    const dx = t.clientX - tourX, dy = t.clientY - tourY; tourX = null;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) A.tourStep(dx < 0 ? 1 : -1);
+  };
   window.ui_toggleMicros = () => { ui.microsOpen = !ui.microsOpen; render(); };
   window.ui_foodQ = (v) => { ui.foodQ = v; const el = $('#lib_list'); if (el) el.innerHTML = libListHTML(); else render(); }; // keep keyboard up
   window.ui_foodCat = (c) => { ui.foodCat = c; render(); };
@@ -922,6 +1008,19 @@
   // ---------- actions ----------
   const A = window.A = {
     go(t) { stopScanner(); ui.tab = t; ui.modal = null; ui.wiz = null; render(); window.scrollTo(0, 0); },
+    startTour() { stopScanner(); ui.wiz = null; ui.modal = { type: 'tour', i: 0 }; ui.tab = tourSteps()[0].tab; render(); window.scrollTo(0, 0); },
+    tourStep(d) {
+      if (!ui.modal || ui.modal.type !== 'tour') return;
+      const steps = tourSteps(), i = C.clamp((ui.modal.i || 0) + d, 0, steps.length - 1);
+      if (i === ui.modal.i) return;
+      ui.modal.i = i; ui.tab = steps[i].tab; render(); window.scrollTo(0, 0);
+    },
+    endTour(cta) { // Skip and finish both count as seen
+      S.tutorialSeen = TUTORIAL_V; save();
+      ui.modal = null;
+      if (cta && !S.goal) { A.startWiz(); return; }
+      ui.tab = 'log'; render(); window.scrollTo(0, 0);
+    },
     reRender: render,
     shiftDay(d) { ui.date = C.addDays(ui.date, d); render(); },
     toggleRem() { S.settings.showRemaining = !S.settings.showRemaining; save(); render(); },
@@ -1225,7 +1324,7 @@
       };
       rd.readAsText(f);
     },
-    reset() { if (confirm('Erase ALL openMACROS data on this device?') && confirm('Really erase everything?')) { S = fresh(); save(); reindex(); render(); } },
+    reset() { if (confirm('Erase ALL openMACROS data on this device?') && confirm('Really erase everything?')) { S = fresh(); save(); reindex(); A.startTour(); } },
   };
 
   // Midnight rollover: a home-screen app resumed the next morning should log to the new day
@@ -1242,6 +1341,8 @@
 
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => { });
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
+  // First open on this device (or after Erase all data) → tutorial
+  if ((+S.tutorialSeen || 0) < TUTORIAL_V) { ui.modal = { type: 'tour', i: 0 }; ui.tab = tourSteps()[0].tab; }
   render();
   window.__S = () => S;
 })();
